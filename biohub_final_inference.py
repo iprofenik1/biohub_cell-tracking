@@ -1,0 +1,7361 @@
+# ============================================================================
+# Biohub 细胞追踪：完整推理管线（教学版）
+# ============================================================================
+# 赛题：给定 3D 荧光显微延时影像（每帧 64×256×256 体素；z 方向 1.625 µm，y/x 方向 0.40625 µm），
+#   逐帧找出每个细胞的中心（节点），再把相邻两帧中的同一个细胞连起来（边）；细胞分裂时，
+#   一个母细胞连出两个子细胞（分叉）。输出全部测试影像的节点表 + 边表（submission.csv）。
+# 评价指标：score = 调整后的边 Jaccard + 0.1 × 分裂 Jaccard。
+#   调整项 adj = J × (1 − 0.1 × (预测节点数 − 估计细胞数) / 估计细胞数)：多报节点会扣分
+#   （不取绝对值：节点数少于估计细胞数时系数反而大于 1）。
+#   GT 只标注了约 2.8% 的细胞：一条预测边只有碰到已标注的轨迹（端点匹配到带相应 GT 边的标注节点）却没连对时
+#   才算 FP，落在未标注区域的边和节点既不算对也不算错。所以整条管线处处在
+#   “多连对一条边”与“少放一个可疑节点”之间权衡。
+#
+# 整体流程（先检测、后追踪）：检测 → 坐标修正 → 关联 → ILP → 后处理 → 分裂补全
+#   1) 检测：时序 3D U-Net 输出“细胞中心”热图；xy 平面 8 视角 TTA + 双模型（两个随机种子）融合；
+#      在 y/x 降采样 4 倍后的网格上，3×3×3 邻域内最大、且概率超过 0.965 的体素就是一个细胞。
+#   2) 坐标修正：降采样后检测坐标只能落在 1.625 µm 的网格点上；10 折坐标头（10 个 224-32-3 的小 MLP）
+#      从 U-Net 特征预测亚体素位移，10 个头的预测取平均后加到检测坐标上。
+#   3) 关联：节点 Transformer 给相邻两帧的细胞对打连接概率 p（正向、反向两次计算后调和融合，
+#      再按需混入副模型），p 超过 0.48 的候选边送入 ILP。
+#   4) ILP：对整段影像一次性全局求解（SCIP），决定保留哪些节点和边。
+#   5) 后处理（按执行顺序）：边过滤 → flow 先验重链接（结果替换全部 ILP 边）→ 找回 →（找回了节点时）再重链接一次
+#      → 单父修复 → 单帧缺口闭合 → 两帧缺口恢复 → 低分峰补缺 → 安全分裂 → 6) → 删除孤立节点与短轨迹 → 线拟合平滑。
+#   6) 分裂补全：分裂补全打分器（逻辑回归）给“只有一个子细胞的母细胞 + 下一帧无父轨迹起点”打分，
+#      过阈值就补上“母细胞 → 第二个子细胞”这条边。它挂在安全分裂这一步上，紧接安全分裂执行，
+#      所以新分叉所在的短分量也会受到“删除短轨迹”里“含分叉的分量保留”规则的保护。
+#
+# 文件结构（按原 notebook 的 13 段顺序执行，每段以“第 N 段：”标记开头）：
+#   第 0–1 段  全局配置（BIOHUB_* 环境变量）与配置漂移守卫
+#   第 2 段    路径与常量
+#   第 3 段    离线安装依赖、物化推理代码与权重、SHA256 完整性校验、副模型
+#   第 4 段    给推理脚本打补丁，再在 GPU 子进程里完成 1)–4)，每段影像输出一个图
+#   第 5 段    后处理函数 filter_output_graph（即 5) 与 6)）；段末用“全部新模块关闭”的配置跑第一遍并写出提交文件
+#   第 6–10 段 第一遍输出的审计、（已关闭的）本地验证器与后处理参数扫描
+#   第 11 段   打开全部新模块跑最终一遍，覆盖提交文件；第 12 段打印实际生效的运行清单
+#
+# 本方案在公开基线（检测、关联都用公开权重）之上的改动：
+#   · 候选概率重链接：把稠密候选缓存（相距 10 µm 以内的细胞对，加上每个 t+1 细胞概率最高的 12 个
+#     候选父亲）里模型给出的概率全部送进重链接；公开基线只给 ILP 选中的边带概率，其余配对的 p 都是 0。
+#   · 全局位移估计：整个视野一起平移 ≥ 3 µm 的帧对（载物台漂移 / 胚胎移动），用位移直方图的众数作为
+#     重链接种子轮的预测位移，代替上一帧对的邻居位移场。
+#   · 跳变感知平滑：线拟合平滑前先扣除整帧跳变的累计量，拟合后再加回，不把跳变台阶抹平。
+#   · 关联特征修正：公开代码 8 视角特征 TTA 中的“反转置”视角其实等于 x 翻转（只有 7 个不同视角）；
+#     用真正的反转置重算一份关联概率，只供候选概率重链接使用。
+#   · 找回概率打分：被找回的节点映射回它原来的检测候选（最近者 ≤ 2 µm、比次近者至少近 1 µm、
+#     唯一认领），继承该候选的模型概率（公开基线里找回节点的 p 为 0）。
+#   · 分裂补全打分器：见上面 6)；在安全分裂之后执行，只增不删。
+#   · ILP 分裂权重 1.2 → 0.4、找回阈值 0.965 → 0.94：两个参数取自公开讨论区。ILP 只在 GPU 子进程里
+#     求解一次，两遍后处理读的是同一份 ILP 结果；找回阈值在两遍后处理里都生效。
+#   · 10 折坐标头：替换公开坐标头（公开基线自带的单个坐标头）。
+#   · 修复截止 11.5 h：超时后剩余影像关闭可选的后处理步骤。公开基线是 7.5 h；本管线要跑两遍后处理，
+#     7.5 h 会把第二遍截断（竞赛限时 12 h）。
+#   两遍后处理：第一遍不开上述后处理新模块，结果另存作参照；最终一遍打开全部模块并覆盖提交文件。
+#   （只有当测试集恰好是可见的 4 段影像时，两遍之间还会多跑一遍诊断；隐藏集重跑时跳过。）
+#   每个新模块出错时都退回本阶段原来的逻辑，保证一定能写出结果。
+#   单组件效果（私榜上的配对差值）：分裂补全打分器 +0.0136，10 折坐标头 +0.0072。
+#
+# 运行环境：Kaggle GPU notebook，关闭网络。需要挂载的输入：
+#   · 竞赛数据 biohub-cell-tracking-during-development
+#   · pilkwang/biohub-tracking-support-pack-50ep-v1       主模型权重 + 推理代码 + 离线 wheel 包
+#   · pilkwang/biohub-temporal-unet3d-seed314159-v1       副模型（另一个随机种子）权重
+#   · pilkwang/biohub-deepcenter-unet3d-center-prior-v1   DeepCenter 中心先验模型
+#   · 你自己的数据集 biohub-cv10-coord-head               第一部分训练出的 fold0.pt … fold9.pt
+#     （第 4 段按 'biohub-cv10-coord-head/fold*.pt' 查找，必须恰好 10 个文件，所以数据集名不能改）
+#   三个 pilkwang/... 是其他用户公开的数据集；权重与推理代码都会做 SHA256 校验，版本不对会直接报错。
+#
+# 教学版只增改了注释与说明文字，运行行为与最终运行的版本完全相同。字面上的改动只有：坐标头数据集名、
+# 一条报错信息改成中文、一个报告字段名、最终一遍的运行标签（只写进 run_stats.csv），以及两段嵌入的模块源码
+# （坐标头、分裂补全打分器）换成带中文注释的等价版本（分裂补全打分器的源码哈希随之更新，它只写进报告）。
+# ============================================================================
+# 这一行必须是整个文件的第一条语句（前面只能有注释）：它让所有类型注解延迟求值。
+# 原 notebook 合并成单个代码单元后，这一行要对全部代码生效，所以不能拆到后面的单元里。
+from __future__ import annotations
+
+
+# ===== 第 0 段：全局配置（BIOHUB_* 环境变量） =====
+# 所有超参数都写成 BIOHUB_* 环境变量。原因：GPU 推理在子进程（支持包里的
+# scripts/predict_unet_transformer.py）中运行，后处理在本进程中运行，环境变量能同时配置两边。
+# 大多数参数由第 2 段读成 Python 常量（只读一次；运行截止、全局位移等少数参数在第 5 段读，
+# 关联与检测相关的在推理子进程里读）；os.environ.get 的第二个参数只是“未设置时的默认值”，
+# 真正生效的是这里写入的值。距离类参数（_UM 结尾）一律以 µm 为单位，比较前坐标都按体素尺寸换算成 µm。
+#
+# 下面这个字符串是公开流水线（Harmonic Fusion）的名称说明。它不在文件开头，所以不是模块文档字符串，
+# 执行时没有任何作用。BIOHUB_PRESET / BIOHUB_SCORE_AXIS 也只被打印，其中的分数是公开流水线自己的
+# 历史标签，与本方案无关。
+'''Biohub Harmonic Fusion
+
+Production 3D lineage reconstruction with dual temporal models,
+dual edge-feature TTA, and geometry-validated divisions.
+
+Record edition.'''
+
+import os
+BIOHUB_PRESET = 'harmonic_v3_division_wide'
+BIOHUB_SCORE_AXIS = 'public 0.939 base + holdout-selected post-process configuration'
+
+# 开启“删除短轨迹”（规则见下方 OUTPUT_MIN_TRACK_LEN）。
+os.environ["BIOHUB_OUTPUT_FILTER_SHORT_TRACKS"] = "1"
+# 检测阈值 0.965：融合热图的 sigmoid 超过 0.965、且是 3×3×3 邻域内最大值的体素才算一个细胞中心（3D NMS）。
+# 阈值取得很高，因为指标按“预测节点数 / 估计细胞数”扣分，每个假细胞都要靠连对的边来还账。
+# 略低于阈值的峰并没有扔掉：超过 0.3 的局部极大会存进低分峰缓存（见本段末尾 BIOHUB_LOWDET_THRESHOLD），
+# 后处理的“找回”和“低分峰补缺”只在轨迹确实需要时才把它们收回。
+os.environ["BIOHUB_DET_THRESHOLD"] = "0.965"
+# 重链接代价 = 运动残差（µm）− 1.0 × p，p 是关联网络给出的连接概率（见第 5 段 motion_relink_edges）。
+# p 从 0 变到 1 最多抵消 1 µm 的位置偏差：几何与学习到的概率按这个比例共同决定匹配。
+os.environ["BIOHUB_MOTION_RELINK_LEARNED_BONUS"] = '1.0'
+# ILP 目标：选中一条边得到 p 的收益（边权 −1.0 × p，见第 2 段 ILP_EDGE_WEIGHT），轨迹出现成本 0，
+# 轨迹消失成本 2。按 tracksdata ILPSolver 对这两项的通常含义（每条轨迹的起点计一次出现成本、终点计一次
+# 消失成本；求解器内部细节不在本文件里）粗略推算：一条链的 Σp 大约要超过 2 才值得保留，ILP 会主动丢掉
+# 短而弱的链，被丢掉的检测之后由“找回”有选择地收回。
+os.environ["BIOHUB_ILP_APPEARANCE_WEIGHT"] = "0.0"
+os.environ["BIOHUB_ILP_DISAPPEARANCE_WEIGHT"] = "2"
+# 单帧缺口闭合：轨迹在 t 帧断开、在 t+2 帧重新出现时，在 t+1 帧插入中点把两段接上（匈牙利一对一匹配）。
+#   门限 = 5.0 µm ×（缺口帧数 + 1）= 10 µm。MAX_GAP 虽然写 2，代码里有效值被限制为 1（只补单帧缺口）。
+#   密度自适应：局部间距 = 同帧 3 个最近邻距离的中位数（取断点与续点两者的平均），
+#   门限 += clip(0.040 × (局部间距 − 6.5 µm), −0.125, +0.125) ×（缺口帧数 + 1），即最多 ±0.25 µm。
+#   细胞稀疏处误连风险小，放宽一点；密集处误连风险大，收紧一点。
+os.environ["BIOHUB_GAP_CLOSE_MAX_GAP"] = "2"
+os.environ["BIOHUB_GAP_CLOSE_UM"] = "5.0"
+os.environ["BIOHUB_GAP_DENSITY_ADAPTIVE"] = "1"
+os.environ["BIOHUB_GAP_DENSITY_REFERENCE_UM"] = "6.5"
+os.environ["BIOHUB_GAP_DENSITY_GAIN"] = "0.040"
+os.environ["BIOHUB_GAP_DENSITY_MAX_STEP_DELTA_UM"] = "0.125"
+os.environ["BIOHUB_GAP_DENSITY_NEIGHBORS"] = "3"
+# 删除短轨迹：节点数 < 6 的连通分量多是误检碎片，删掉它们能减少节点数（指标对多报节点扣分）；
+# 含分叉（某个节点出度 ≥ 2）的分量即使很短也保留，以免丢掉分裂得分。
+os.environ["BIOHUB_OUTPUT_MIN_TRACK_LEN"] = "6"
+os.environ["BIOHUB_OUTPUT_KEEP_DIVISION_COMPONENTS"] = "1"
+# 严格两帧缺口恢复：t 帧的轨迹终点与 t+3 帧的轨迹起点距离足够近、且插值步与断点的上一步或续点的
+# 下一步（至少一侧）方向一致时，按 1/3、2/3 插入两个插值点（再按亮度微调）把它们接上；门限见第 2 段 GAP2_*。
+os.environ["BIOHUB_OUTPUT_GAP2_RECOVERY"] = "1"
+# 安全分裂（原流程自带的手工门限分叉补全）：在重链接与补缺之后，把 t 帧“只有一个子细胞 A 的母细胞 M”
+# 与 t+1 帧“没有父亲的轨迹起点 B”配对，补上 M → B 必须同时满足：
+#   M→B ≤ 9.0 µm（MAX_UM）；A 与 B（两姐妹）相距 ≤ 14.0 µm（SISTER_MAX_UM）；M→A ≤ 10.0 µm（EXISTING_CHILD_MAX_UM）；
+#   B 是离 A 最近的无父节点；
+#   A、B 在 t+2 帧各有唯一后继，且两姐妹在 t+2 帧的间距比 t+1 帧至少大 2.25 µm（DIVERGE_UM：真分裂的姐妹会越走越远）；
+#   M 到两个子细胞的距离对称：|M→A − M→B| / 二者均值 ≤ 0.6（SYMMETRY_TAU）；
+#   B 处 DeepCenter 中心热图 ≥ 0.25（见下方 DEEPCENTER_SAFE_DIV_THRESHOLD）。
+# 新增分叉的上限：每帧 ≤ max(1, round(该帧单子细胞母细胞数 × 0.0076))，全片 ≤ max(1, round(边数 × 0.00375))。
+# GT 分裂很少，做对一次很值钱，但假分叉同样扣分，所以这些门限的宗旨是“宁缺毋滥”；
+# 更多分裂交给第 5 段的分裂补全打分器。
+os.environ["BIOHUB_SAFE_DIV_MAX_UM"] = "9.0"  
+
+
+os.environ["BIOHUB_SAFE_DIV_SISTER_MAX_UM"] = "14.0"  
+
+
+
+os.environ["BIOHUB_SAFE_DIV_SISTER_SYMMETRY_TAU"] = "0.6"  
+os.environ["BIOHUB_SAFE_DIV_DIVERGE_UM"] = "2.25"  
+
+
+os.environ["BIOHUB_SAFE_DIV_EXISTING_CHILD_MAX_UM"] = "10.0"
+os.environ["BIOHUB_SAFE_DIV_FRAME_FRAC_CAP"] = "0.0076"
+os.environ["BIOHUB_SAFE_DIV_GLOBAL_FRAC_CAP"] = "0.00375"
+
+# ILP 分裂成本 0.4（公开基线为 1.2，这一改动取自公开讨论区）。按上面同样的成本定义推算：轨迹出现成本为 0 时，
+# 第二个子细胞总能“免费”开一条新轨迹，所以分裂成本 ≥ 1 时 ILP 根本不会输出分叉；降到 0.4 后，第二个子细胞的
+# p 超过 0.4 时 ILP 就会选择分叉，并保留它所在的短链。由于之后的重链接会替换全部 ILP 边，这个参数
+# 在本管线中实际只改变 ILP 保留下来的节点集合（多留下少量节点）。
+os.environ["BIOHUB_ILP_DIVISION_WEIGHT"] = "0.4"     
+# 短轨迹救回：只有当删除短轨迹去掉了 ≥ 10% 的节点时才触发（触发比例用第 2 段的默认值 0.10）——
+# 说明这段影像的轨迹很碎、过滤过头了。此时救回长度 4–5、平均边概率 ≥ 0.88、平均步长 ≤ 3.0 µm 的
+# 高置信短分量，救回总量 ≤ min(120, 节点数 × 1.2%)。
+os.environ["BIOHUB_ADAPTIVE_SHORT_TRACK_RESCUE"] = "1"
+os.environ["BIOHUB_SHORT_TRACK_RESCUE_MIN_LEN"] = "4"
+os.environ["BIOHUB_SHORT_TRACK_RESCUE_MIN_MEAN_EDGE_PROB"] = "0.88"
+os.environ["BIOHUB_SHORT_TRACK_RESCUE_MAX_MEAN_EDGE_DIST_UM"] = "3.0"
+os.environ["BIOHUB_SHORT_TRACK_RESCUE_MAX_NODES_FRAC"] = "0.012"
+os.environ["BIOHUB_SHORT_TRACK_RESCUE_MAX_NODES_ABS"] = "120"
+# DeepCenter 否决（只审核新增点的门）：DeepCenter 是另一个公开的 3D U-Net，只预测“细胞中心先验”热图。
+# 它只审核后处理“新加”的东西——单帧缺口闭合合成的中点、安全分裂要新接上的第二个子细胞（查它所在的位置）——
+# 该点附近窗口内的热图最大值低于阈值（这里两者都是 0.25）就拒绝这次添加；它从不删除检测器原有的节点。
+# 缺口闭合里只有跨度 ≥ 8.5 µm 的合成中点才需要审核：短跨度插值几乎总是对的，复用的已有节点也不审核。
+# REQUIRE = 1：加载失败直接报错，而不是悄悄关闭否决；EXPECTED_EPOCH = 2：checkpoint 里记录的 epoch 字段必须等于 2，防止误用别的 checkpoint。
+# CHECKPOINT 路径会在第 3 段校验 SHA256 后改写成实际找到的文件。分裂补全打分器也把它的热图当作特征。
+os.environ["BIOHUB_USE_DEEPCENTER_VETO"] = "1"
+os.environ["BIOHUB_REQUIRE_DEEPCENTER_VETO"] = "1"
+os.environ["BIOHUB_DEEPCENTER_EXPECTED_EPOCH"] = "2"
+os.environ["BIOHUB_DEEPCENTER_GAP_CONFIRM_MIN_SPAN_UM"] = "8.5"
+os.environ["BIOHUB_DEEPCENTER_CHECKPOINT"] = "/kaggle/input/biohub-deepcenter-unet3d-center-prior-v1/weights/full_frame_center/best.pt"
+os.environ["BIOHUB_DEEPCENTER_GAP_VETO"] = "1"
+os.environ["BIOHUB_DEEPCENTER_GAP_THRESHOLD"] = "0.25"
+os.environ["BIOHUB_DEEPCENTER_SAFE_DIV_VETO"] = "1"
+# RUN_OUTPUT_DIAGNOSTICS 在第 2 段读成常量后全文件没有再用到。
+os.environ["BIOHUB_RUN_OUTPUT_DIAGNOSTICS"] = "0"
+# 双向调和融合：同一个关联网络把两帧顺序交换再算一次“反向”概率 p_r（先对齐到正向 logit 的尺度），
+# 与正向概率 p_f 做加权调和平均：p = 1 / [(1 − w) / p_f + w / p_r]，w = 0.15，
+# 再对每个 t+1 细胞的全部候选父亲重新归一化，然后换回正向 logit 的尺度（后面的副模型混合、
+# 0.48 候选阈值和 ILP 都沿用原来的尺度）。调和平均对小值敏感：只要有一个时间方向不认可，
+# 这条连接就会被明显压低。FUSION_MODE 只用于守卫和打印。
+# 保留率守卫 0.90：双模型融合后某帧的检测峰数若少于主模型单独检测的 90%，这一帧回退为只用主模型，
+# 防止融合把弱峰“抹平”造成漏检。
+os.environ["BIOHUB_BIDIRECTIONAL_EDGE_WEIGHT"] = "0.15"
+os.environ["BIOHUB_BIDIRECTIONAL_FUSION_MODE"] = "harmonic_probability"
+os.environ["BIOHUB_DUAL_SEED_MIN_CANDIDATE_RETENTION"] = "0.90"
+# 以下是诊断 / 本地验证器参数：DIAGNOSTIC_ARM 非空时推理子进程额外写出检测坐标清单（纯记录）；
+# 验证器在本 notebook 中关闭（见下方 BIOHUB_VALIDATOR_ENABLE = "0"），所以 PPSWEEP_* 控制的
+# 后处理参数扫描不会运行，后处理保持默认配置。
+os.environ["BIOHUB_DIAGNOSTIC_ARM"] = "harmonic_association_production"
+os.environ["BIOHUB_VALIDATOR_N_PER_TYPE"] = "4"
+os.environ["BIOHUB_PPSWEEP_SELECT_MARGIN"] = "0.001"
+os.environ["BIOHUB_PPSWEEP_MAX_ADJ_LOSS"] = "0.0005"
+
+# 安全分裂要新接上的第二个子细胞也要过 DeepCenter：阈值 0.25（代码默认 0.12，这里更严）。
+# DeepCenter 热图也做 TTA：x / y / xy 翻转；Y、X 等长时再加两次 90° 旋转、转置，以及“先旋转 90° 再转置”
+# （它恰好等于 x 翻转，所以 8 个视角里只有 7 个不同），各视角反变换回原坐标后对 logit 取平均，否决判断更稳定。
+os.environ["BIOHUB_DEEPCENTER_SAFE_DIV_THRESHOLD"] = "0.25"
+os.environ["BIOHUB_DEEPCENTER_TTA"] = "1"
+
+# 运行时保护（隐藏测试集重跑同样限时 12 h），这些设置不改变可见测试集上的输出：
+#   KERNEL_START_TS：截止计时的起点（notebook 启动时刻）。
+#   VALIDATOR_ENABLE = 0：关闭样本内验证器（在训练影像上算本地分的代理工具，每次约 11 分钟 GPU）。
+#   ILP_TIMEOUT_S = 1200：每段影像的 ILP 最多求解 1200 s，到时 SCIP 返回当前找到的最优可行解。
+#   REPAIR_DEADLINE_S = 41400：启动 11.5 h 后，剩余影像关闭可选的后处理步骤（重链接、缺口闭合、
+#     两帧缺口、安全分裂、线拟合平滑），保证 12 h 内写出结果。公开基线是 7.5 h；本管线要跑两遍后处理，
+#     7.5 h 会让第二遍被截断，所以放宽到 11.5 h。
+#   FRAME_CACHE_MAX_FRAMES = 48：后处理读原图的帧缓存上限，控制内存。
+# （下面几行行尾的英文注释与这里的说明含义相同，保留原样。）
+import time as _t0_time
+os.environ["BIOHUB_KERNEL_START_TS"] = str(_t0_time.time())
+os.environ["BIOHUB_VALIDATOR_ENABLE"] = "0"          # in-sample train proxy, ~11 min of GPU per run
+os.environ["BIOHUB_ILP_TIMEOUT_S"] = "1200"           # per dataset; SCIP keeps its incumbent at the limit
+os.environ["BIOHUB_REPAIR_DEADLINE_S"] = "41400"      # 11.5 h after kernel start the repair loop degrades (competition limit 12 h)
+os.environ["BIOHUB_FRAME_CACHE_MAX_FRAMES"] = "48"
+# 重链接紧门限 5.5 µm（行尾英文注释的意思：该值由公开流水线的后处理参数扫描选出）。
+# flow 模式下它用作“种子轮”的门限：先只接受很近、很可靠的匹配，再用它们估计位移场。
+os.environ["BIOHUB_MOTION_RELINK_TIGHT_UM"] = "5.5"   # ppsweep_selected.json of the public run (tight55)
+# flow 先验重链接：胚胎里的细胞成群移动，“邻居怎么动，我大概也怎么动”。
+#   位移场：对每个细胞，取 40 µm 内最多 12 个已匹配邻居的位移，取中位数（中位数不怕少数错配）；
+#   整帧可用样本少于 4 个时不建场；距离 < 1.5 µm 的样本（即细胞自己的种子匹配）被排除，防止错误种子给自己投票。
+#   seed 模式：先用上一帧对的位移场预测位置，以 5.5 µm 门限做一轮匈牙利匹配得到种子，
+#     再用这些种子建立当前帧对的位移场，按它预测每个细胞在下一帧的位置。
+#   GATE = 1：目标只要落在“原位置”或“预测位置”的门限内就能参与匹配，随邻居快速移动的细胞
+#     也能在紧门限轮里竞争，而不必等到宽门限轮（那时它的目标可能已被别的细胞抢走）。
+#   没有位移场的细胞退回“0.5 × 上一步速度”外推。
+os.environ["BIOHUB_MOTION_RELINK_FLOW_MODE"] = "seed"
+os.environ["BIOHUB_MOTION_RELINK_FLOW_K"] = "12"
+os.environ["BIOHUB_MOTION_RELINK_FLOW_RADIUS_UM"] = "40.0"
+os.environ["BIOHUB_MOTION_RELINK_FLOW_EXCLUDE_UM"] = "1.5"
+os.environ["BIOHUB_MOTION_RELINK_FLOW_MIN_SAMPLES"] = "4"
+os.environ["BIOHUB_MOTION_RELINK_FLOW_GATE"] = "1"
+# 有位移场时做两轮匈牙利一对一匹配：先用紧门限 7.0 µm，剩下的再用宽门限（RELAXED = 0 表示沿用第 2 段默认的 10.0 µm）。
+#   代价 = |目标 − 预测位置| − 1.0 × p；Z_WEIGHT = 1.0 表示 z 方向不额外加权；
+#   RAW_COST = 0 表示原始位移距离不额外计价；RAW_ADMIT = 1 表示按原始距离进入门限的配对也接纳；
+#   ITER = 1 表示不迭代细化位移场；SEED_GATE_UM = 0 表示种子轮沿用上面的紧门限 5.5 µm。
+os.environ["BIOHUB_MOTION_RELINK_FLOW_ITER"] = "1"
+os.environ["BIOHUB_MOTION_RELINK_FLOW_SEED_GATE_UM"] = "0"
+os.environ["BIOHUB_MOTION_RELINK_FLOW_RAW_ADMIT"] = "1"
+os.environ["BIOHUB_MOTION_RELINK_FLOW_Z_WEIGHT"] = "1.0"
+os.environ["BIOHUB_MOTION_RELINK_FLOW_RAW_COST"] = "0"
+os.environ["BIOHUB_MOTION_RELINK_FLOW_TIGHT_UM"] = "7.0"
+os.environ["BIOHUB_MOTION_RELINK_FLOW_RELAXED_UM"] = "0"
+# 全局位移估计（本方案新增）：有些帧对整个视野一起平移（载物台漂移 / 胚胎移动），上一帧对的位移场
+#   预料不到这种跳变，种子匹配会整体出错。做法：把两帧间 15 µm 内全部配对的位移放进 3D 直方图
+#   （1.625 µm 一格）找众数，再取众数附近位移的中位数——正确配对堆在同一格，错误配对散在整个球面上，
+#   因此不需要任何链接概率。整体平移 ≥ 3.0 µm 时，用它代替上一帧对的位移场作为种子轮的预测。
+# 跳变感知平滑（本方案新增）：某帧对的边位移中位数 ≥ 3.0 µm 时视为整帧跳变；线拟合平滑前先减去
+#   跳变的累计量，拟合后再加回，避免直线把跳变前后的点互相拉近、抹平台阶。
+# 两者只在打开新模块的那一遍后处理中启用（即最终一遍；可见集上的诊断遍也会打开），第一遍参照结果
+# 不受影响；出错时退回原逻辑。
+os.environ["BIOHUB_MOTION_RELINK_GLOBAL_SEED_MIN_UM"] = "3.0"
+os.environ["BIOHUB_OUTPUT_LINEFIT_JUMP_MIN_UM"] = "3.0"
+# 找回：第一次重链接之后，把“被 ILP 丢掉的检测峰”和“略低于检测阈值的峰”重新加入节点集。条件：
+#   峰的分数 ≥ 0.94、离已有节点 > 2.0 µm（GAPFILL_EXCLUDE_UM），并且 4 µm 内有一个开放端点——
+#   上一帧没有出边的轨迹终点，或下一帧没有入边的轨迹起点。随后的第二次重链接决定它能否连上，
+#   连不上的会作为孤立节点被删掉。
+# 找回阈值 0.94（公开基线为 0.965，新值取自公开讨论区）低于检测阈值 0.965，所以 [0.94, 0.965)
+#   之间的亚阈值峰也能被找回。
+os.environ["BIOHUB_READMIT_RADIUS_UM"] = "4"
+os.environ["BIOHUB_READMIT_MIN_SCORE"] = "0.94"
+# 低分峰补缺：在单帧缺口闭合与两帧缺口恢复之后，处理仍然开着的 1–3 帧缺口（MAX_GAP = 3）。
+#   候选：t 帧轨迹终点与 t+g+1 帧轨迹起点，距离 ≤ 5.0 µm ×（g + 1），且与两端已有的运动方向不相反
+#   （夹角余弦 > −0.25，CONTEXT = 1）。
+#   沿两点连线在每个缺失帧上取采样点，在 3.5 µm 内找分数 ≥ 0.5、离已有节点 > 2.0 µm 的低分峰；
+#   每个缺失帧都必须找到真实的峰才接上（ALLOW_SYNTHETIC = 0：不允许合成点）。
+#   同一 (t, g) 的配对用匈牙利算法按“平均每帧位移 + 峰偏离直线的平均距离”分配；新增节点 ≤ 节点数 × 3%。
+# 原理：细胞暗淡或拥挤时检测分数偏低，但恰好落在运动轨迹上的低分峰很可能是真细胞。
+os.environ["BIOHUB_GAPFILL_MAX_GAP"] = "3"
+os.environ["BIOHUB_GAPFILL_MIN_SCORE"] = "0.5"
+os.environ["BIOHUB_GAPFILL_STEP_UM"] = "5.0"
+os.environ["BIOHUB_GAPFILL_PEAK_RADIUS_UM"] = "3.5"
+os.environ["BIOHUB_GAPFILL_EXCLUDE_UM"] = "2.0"
+os.environ["BIOHUB_GAPFILL_ALLOW_SYNTHETIC"] = "0"
+os.environ["BIOHUB_GAPFILL_CONTEXT"] = "1"
+os.environ["BIOHUB_GAPFILL_MAX_ADDED_FRAC"] = "0.03"
+# 推理子进程把每段影像的检测结果，以及 sigmoid 超过 0.3 的全部局部极大（低分峰：low_coords / low_score），
+# 写到 edge_cache/<影像>.npz，供找回与低分峰补缺使用。
+# CACHE_EDGE_THRESHOLD = 1.0：概率不可能超过 1，所以这里不转储任何边（第 4 段还会把它改成 0，同样不转储）；
+# 候选概率重链接用的稠密候选概率另有缓存（第 4 段）。
+os.environ["BIOHUB_CACHE_DIR"] = "/kaggle/working/edge_cache"
+os.environ["BIOHUB_CACHE_EDGE_THRESHOLD"] = "1.0"
+os.environ["BIOHUB_LOWDET_THRESHOLD"] = "0.3"
+# 只打印公开流水线遗留的标签，不影响计算。
+print("BIOHUB_PRESET:", BIOHUB_PRESET)
+print("BIOHUB_SCORE_AXIS:", BIOHUB_SCORE_AXIS)
+
+# ===== 第 1 段：配置漂移守卫 =====
+
+# 关键参数（检测阈值、ILP 出现 / 消失成本、缺口门限、最短轨迹长度、双向权重与融合模式、保留率）
+# 必须与预期完全一致，否则立即报错。隐藏集重跑时看不到运行过程，硬失败比悄悄用错配置跑完更安全。
+# 教学提示：修改第 0 段的这几个参数时，必须同时修改这里的期望值。
+import json as _guard_json
+import math as _guard_math
+import os as _guard_os
+
+_EXPECTED_NUMERIC = {
+    "BIOHUB_DET_THRESHOLD": 0.965,
+    "BIOHUB_ILP_APPEARANCE_WEIGHT": 0.0,
+    "BIOHUB_ILP_DISAPPEARANCE_WEIGHT": 2,
+    "BIOHUB_GAP_CLOSE_UM": 5.0,
+    "BIOHUB_OUTPUT_MIN_TRACK_LEN": 6.0,
+    "BIOHUB_BIDIRECTIONAL_EDGE_WEIGHT": 0.15,
+}
+
+_EXPECTED_TEXT = {
+    "BIOHUB_BIDIRECTIONAL_FUSION_MODE": "harmonic_probability",
+    "BIOHUB_DUAL_SEED_MIN_CANDIDATE_RETENTION": "0.90",
+}
+
+# 数值参数按浮点比较（绝对容差 1e-12），文本参数按字符串精确比较；缺失也算漂移。
+_drift = {}
+for _key, _want in _EXPECTED_NUMERIC.items():
+    _raw = _guard_os.environ.get(_key)
+    if _raw is None:
+        _drift[_key] = "missing"
+        continue
+    _got = float(_raw)
+    if not _guard_math.isclose(_got, _want, rel_tol=0.0, abs_tol=1e-12):
+        _drift[_key] = {"expected": _want, "actual": _got}
+
+for _key, _want in _EXPECTED_TEXT.items():
+    _got = _guard_os.environ.get(_key)
+    if _got != _want:
+        _drift[_key] = {"expected": _want, "actual": _got}
+
+if _drift:
+    raise RuntimeError(
+        "Configuration drift detected: " + _guard_json.dumps(_drift, sort_keys=True)
+    )
+
+print("Configuration guard: PASS")
+# 下面三行打印是公开流水线遗留的说明文字（括号里的分数是公开流水线自己的历史标签）；
+# 其中 "0.200" 已经过时，实际的反向权重以第 0 段的 0.15 为准。
+print("Baseline: fixed-90 dual-seed clean pipeline (public LB 0.913)")
+print("Single model-level change: harmonic mutual-support association fusion")
+print("Reverse-time association weight: 0.200")
+
+
+# ===== 第 2 段：路径与常量 =====
+
+# 把第 0 段写入的环境变量读成 Python 常量。os.environ.get 的第二个参数只是“未设置时的默认值”，
+# 真正生效的是第 0 段的值（例如检测阈值默认 0.99，实际为 0.965）。
+# 注意：这些常量只在这里读一次，之后再改 os.environ 不会影响后处理（要改就直接改这些全局变量）。
+import csv
+import importlib.util
+import json
+import math
+import os
+import shutil
+import subprocess
+import tempfile
+import zipfile
+import sys
+import time
+from pathlib import Path
+
+import pandas as pd
+# IPython.display 用于在 notebook 里显示表格；脱离 notebook 运行时环境里也要有 IPython。
+from IPython.display import display
+
+# 竞赛数据目录兼容两种 Kaggle 挂载路径（取第一个存在的）。TEST_DIR 下每个 <影像>.zarr 是一段待追踪的影像；
+# 隐藏集重跑时这里会换成全部隐藏测试影像，所以代码里不能写死影像名或影像数。
+COMPETITION = "biohub-cell-tracking-during-development"
+COMP_DIR_CANDIDATES = [
+    Path(f"/kaggle/input/competitions/{COMPETITION}"),
+    Path(f"/kaggle/input/{COMPETITION}"),
+]
+COMP_DIR = next((path for path in COMP_DIR_CANDIDATES if path.exists()), COMP_DIR_CANDIDATES[0])
+
+# 教学包第一、二部分的数据准备脚本会用补丁改写这一行，让整条管线改在训练影像子集上运行。
+TEST_DIR = COMP_DIR / "test"
+
+# /kaggle/working 是 Kaggle 上唯一可写、并会作为输出保存的目录；submission.csv 是评分读取的文件名，不能改。
+WORKING_DIR = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path(".")
+REPO_DIR = WORKING_DIR / "tracking_repo"
+SUBMISSION_PATH = WORKING_DIR / "submission.csv"
+RUN_STATS_PATH = WORKING_DIR / "run_stats.csv"
+
+# 主模型：时序 3D U-Net（逐体素检测热图 + 32 通道特征）+ 节点 Transformer（给相邻两帧的细胞两两打连接分）。
+# 权重与推理代码来自公开支持包数据集（TARGET_ARTIFACT_SLUG）；只接受名称与该 slug 一致的支持包，
+# 防止误挂旧版本。EXPERIMENT_TAG 只写进运行统计。
+METHOD = "unet_transformer"
+WEIGHTS_RELATIVE = f"weights/{METHOD}/split_0/edge_predictor_best.pth"
+EXPERIMENT_TAG = "selected_101_dual_seed_near_balanced_center_confirmed_synthetic_gap"
+TARGET_ARTIFACT_SLUG = os.environ.get("BIOHUB_TARGET_ARTIFACT_SLUG", "biohub-tracking-support-pack-50ep-v1")
+PRIMARY_ARTIFACT_MANIFEST = Path(os.environ.get(
+    "BIOHUB_PRIMARY_ARTIFACT_MANIFEST",
+    "/kaggle/input/datasets/pilkwang/biohub-tracking-support-pack-50ep-v1/ARTIFACT_MANIFEST.json",
+))
+ALLOW_ARTIFACT_FALLBACK = os.environ.get("BIOHUB_ALLOW_ARTIFACT_FALLBACK", "0") != "0"
+
+# 检测阈值与 ILP 权重会作为命令行参数传给 GPU 推理子进程（ILP 在子进程里逐段影像求解）。
+# ILP_EDGE_WEIGHT = −1.0：选中一条边的代价是 −p（即收益 p）；出现 / 消失 / 分裂成本的实际值见第 0 段。
+DET_THRESHOLD = float(os.environ.get("BIOHUB_DET_THRESHOLD", "0.99"))
+UNET_BATCH_SIZE = int(os.environ.get("BIOHUB_UNET_BATCH_SIZE", "4"))
+USE_ILP = os.environ.get("BIOHUB_USE_ILP", "1") != "0"
+ILP_EDGE_WEIGHT = float(os.environ.get("BIOHUB_ILP_EDGE_WEIGHT", "-1.0"))
+ILP_APPEARANCE_WEIGHT = float(os.environ.get("BIOHUB_ILP_APPEARANCE_WEIGHT", "0.1"))
+ILP_DISAPPEARANCE_WEIGHT = float(os.environ.get("BIOHUB_ILP_DISAPPEARANCE_WEIGHT", "0.1"))
+ILP_DIVISION_WEIGHT = float(os.environ.get("BIOHUB_ILP_DIVISION_WEIGHT", "1.0"))
+
+
+# SLICE 为空表示处理全部影像；检测到两张 GPU 时，会自动按 0::2 / 1::2 把影像分给两个子进程并行。
+SLICE = ""
+
+
+
+# ALLOW_PIP_INSTALL = 0：代码竞赛禁止联网，依赖只能从挂载数据集里的 wheel 离线安装。
+ALLOW_PIP_INSTALL = os.environ.get("BIOHUB_ALLOW_PIP_INSTALL", "0") != "0"
+RUN_OUTPUT_DIAGNOSTICS = os.environ.get("BIOHUB_RUN_OUTPUT_DIAGNOSTICS", "1") != "0"
+
+
+# 后处理第一步“边过滤”：只保留相邻帧之间（指标只计 t → t+1 的边）、长度 ≤ 14 µm 的边。
+# 单父修复：每个节点只保留 (p, −距离) 最大的那个父亲（一个细胞只能有一个母细胞）；单子修复关闭，以便保留分叉。
+# 删除孤立节点：没有任何边的节点不输出——它只增加节点数，拿不到任何边分。
+# 重链接：任一帧节点数 > 2600 时整段影像跳过重链接（匈牙利算法的代价随规模立方增长）；
+# 没有位移场时，按 0.5 × 上一步速度外推细胞的下一位置。
+OUTPUT_EDGE_MAX_UM = float(os.environ.get("BIOHUB_OUTPUT_EDGE_MAX_UM", "14.0"))
+OUTPUT_ENFORCE_NEXT_FRAME = os.environ.get("BIOHUB_OUTPUT_ENFORCE_NEXT_FRAME", "1") != "0"
+OUTPUT_SINGLE_PARENT_REPAIR = os.environ.get("BIOHUB_OUTPUT_SINGLE_PARENT_REPAIR", "1") != "0"
+OUTPUT_SINGLE_CHILD_REPAIR = os.environ.get("BIOHUB_OUTPUT_SINGLE_CHILD_REPAIR", "0") != "0"
+OUTPUT_PRUNE_ISOLATED = os.environ.get("BIOHUB_OUTPUT_PRUNE_ISOLATED", "1") != "0"
+OUTPUT_MOTION_RELINK = os.environ.get("BIOHUB_OUTPUT_MOTION_RELINK", "1") != "0"
+MOTION_RELINK_TIGHT_UM = float(os.environ.get("BIOHUB_MOTION_RELINK_TIGHT_UM", "6.0"))
+MOTION_RELINK_RELAXED_UM = float(os.environ.get("BIOHUB_MOTION_RELINK_RELAXED_UM", "10.0"))
+MOTION_RELINK_VELOCITY_WEIGHT = float(os.environ.get("BIOHUB_MOTION_RELINK_VELOCITY_WEIGHT", "0.5"))
+MOTION_RELINK_FLOW_MODE = os.environ.get("BIOHUB_MOTION_RELINK_FLOW_MODE", "off").strip().lower()
+MOTION_RELINK_FLOW_K = int(os.environ.get("BIOHUB_MOTION_RELINK_FLOW_K", "8"))
+MOTION_RELINK_FLOW_RADIUS_UM = float(os.environ.get("BIOHUB_MOTION_RELINK_FLOW_RADIUS_UM", "25.0"))
+MOTION_RELINK_FLOW_EXCLUDE_UM = float(os.environ.get("BIOHUB_MOTION_RELINK_FLOW_EXCLUDE_UM", "1.5"))
+MOTION_RELINK_FLOW_MIN_SAMPLES = int(os.environ.get("BIOHUB_MOTION_RELINK_FLOW_MIN_SAMPLES", "4"))
+MOTION_RELINK_FLOW_GATE = os.environ.get("BIOHUB_MOTION_RELINK_FLOW_GATE", "0").strip() == "1"
+MOTION_RELINK_FLOW_ITER = int(os.environ.get("BIOHUB_MOTION_RELINK_FLOW_ITER", "1"))
+MOTION_RELINK_FLOW_SEED_GATE_UM = float(os.environ.get("BIOHUB_MOTION_RELINK_FLOW_SEED_GATE_UM", "0"))
+MOTION_RELINK_FLOW_RAW_ADMIT = os.environ.get("BIOHUB_MOTION_RELINK_FLOW_RAW_ADMIT", "1").strip() != "0"
+MOTION_RELINK_FLOW_Z_WEIGHT = float(os.environ.get("BIOHUB_MOTION_RELINK_FLOW_Z_WEIGHT", "1.0"))
+MOTION_RELINK_FLOW_RAW_COST = float(os.environ.get("BIOHUB_MOTION_RELINK_FLOW_RAW_COST", "0.05"))
+MOTION_RELINK_FLOW_TIGHT_UM = float(os.environ.get("BIOHUB_MOTION_RELINK_FLOW_TIGHT_UM", "0"))
+MOTION_RELINK_FLOW_RELAXED_UM = float(os.environ.get("BIOHUB_MOTION_RELINK_FLOW_RELAXED_UM", "0"))
+# 找回 / 低分峰补缺在这里的默认值是“关闭”（半径 0、最大缺口 0），实际由第 0 段打开。
+READMIT_RADIUS_UM = float(os.environ.get("BIOHUB_READMIT_RADIUS_UM", "0"))
+READMIT_MIN_SCORE = float(os.environ.get("BIOHUB_READMIT_MIN_SCORE", "0.965"))
+GAPFILL_MAX_GAP = int(os.environ.get("BIOHUB_GAPFILL_MAX_GAP", "0"))
+GAPFILL_MIN_SCORE = float(os.environ.get("BIOHUB_GAPFILL_MIN_SCORE", "0.5"))
+GAPFILL_STEP_UM = float(os.environ.get("BIOHUB_GAPFILL_STEP_UM", "5.0"))
+GAPFILL_PEAK_RADIUS_UM = float(os.environ.get("BIOHUB_GAPFILL_PEAK_RADIUS_UM", "3.5"))
+GAPFILL_EXCLUDE_UM = float(os.environ.get("BIOHUB_GAPFILL_EXCLUDE_UM", "2.0"))
+GAPFILL_ALLOW_SYNTHETIC = int(os.environ.get("BIOHUB_GAPFILL_ALLOW_SYNTHETIC", "0"))
+GAPFILL_CONTEXT = os.environ.get("BIOHUB_GAPFILL_CONTEXT", "1") != "0"
+GAPFILL_MAX_ADDED_FRAC = float(os.environ.get("BIOHUB_GAPFILL_MAX_ADDED_FRAC", "0.03"))
+MOTION_RELINK_LEARNED_BONUS = float(os.environ.get("BIOHUB_MOTION_RELINK_LEARNED_BONUS", "0.75"))
+MOTION_RELINK_MAX_FRAME_NODES = int(os.environ.get("BIOHUB_MOTION_RELINK_MAX_FRAME_NODES", "2600"))
+
+# 分叉几何过滤（默认关闭，第 0 段也没有打开）：本管线不用它，分叉由安全分裂和分裂补全打分器控制。
+OUTPUT_DIVISION_GEOMETRY_FILTER = os.environ.get("BIOHUB_OUTPUT_DIVISION_GEOMETRY_FILTER", "0") != "0"
+DIV_PARENT_MAX_UM = float(os.environ.get("BIOHUB_DIV_PARENT_MAX_UM", "10.5"))
+DIV_SISTER_MAX_UM = float(os.environ.get("BIOHUB_DIV_SISTER_MAX_UM", "8.0"))
+DIV_DROP_TO_SINGLE_IF_BAD = os.environ.get("BIOHUB_DIV_DROP_TO_SINGLE_IF_BAD", "1") != "0"
+# 单帧缺口闭合（原理见第 0 段）。插中点时：t+1 帧离中点 3.2 µm 内若已有孤立节点，就直接复用它；
+# 否则合成一个新点，并在原图 z ±1、y/x ±3 体素的窗口内，按“亮度减去 20% 分位基线”加权求质心微调
+# （微调移动超过 3.2 µm 则放弃）。合成点总数 ≤ min(2000, 节点数 × 5%)。
+OUTPUT_GAP_CLOSE = os.environ.get("BIOHUB_OUTPUT_GAP_CLOSE", "1") != "0"
+GAP_CLOSE_MAX_GAP = int(os.environ.get("BIOHUB_GAP_CLOSE_MAX_GAP", "1"))
+GAP_CLOSE_UM = float(os.environ.get("BIOHUB_GAP_CLOSE_UM", "6.0"))
+GAP_DENSITY_ADAPTIVE = os.environ.get("BIOHUB_GAP_DENSITY_ADAPTIVE", "0") != "0"
+GAP_DENSITY_REFERENCE_UM = float(os.environ.get("BIOHUB_GAP_DENSITY_REFERENCE_UM", "6.5"))
+GAP_DENSITY_GAIN = float(os.environ.get("BIOHUB_GAP_DENSITY_GAIN", "0.040"))
+GAP_DENSITY_MAX_STEP_DELTA_UM = float(os.environ.get("BIOHUB_GAP_DENSITY_MAX_STEP_DELTA_UM", "0.125"))
+GAP_DENSITY_NEIGHBORS = int(os.environ.get("BIOHUB_GAP_DENSITY_NEIGHBORS", "3"))
+GAP_CLOSE_REUSE_EXISTING = os.environ.get("BIOHUB_GAP_CLOSE_REUSE_EXISTING", "1") != "0"
+GAP_CLOSE_REUSE_UM = float(os.environ.get("BIOHUB_GAP_CLOSE_REUSE_UM", "3.2"))
+GAP_CLOSE_MAX_ADDED_FRAC = float(os.environ.get("BIOHUB_GAP_CLOSE_MAX_ADDED_FRAC", "0.05"))
+GAP_CLOSE_MAX_ADDED_ABS = int(os.environ.get("BIOHUB_GAP_CLOSE_MAX_ADDED_ABS", "2000"))
+GAP_REFINE_SYNTHETIC = os.environ.get("BIOHUB_GAP_REFINE_SYNTHETIC", "1") != "0"
+GAP_REFINE_WIN_Z = int(os.environ.get("BIOHUB_GAP_REFINE_WIN_Z", "1"))
+GAP_REFINE_WIN_YX = int(os.environ.get("BIOHUB_GAP_REFINE_WIN_YX", "3"))
+GAP_REFINE_MAX_SHIFT_UM = float(os.environ.get("BIOHUB_GAP_REFINE_MAX_SHIFT_UM", "3.2"))
+
+# 删除短轨迹与短轨迹救回（原理见第 0 段；这里的默认值大多被第 0 段覆盖）。
+OUTPUT_FILTER_SHORT_TRACKS = os.environ.get("BIOHUB_OUTPUT_FILTER_SHORT_TRACKS", "1") != "0"
+OUTPUT_MIN_TRACK_LEN = int(os.environ.get("BIOHUB_OUTPUT_MIN_TRACK_LEN", "6"))
+OUTPUT_KEEP_DIVISION_COMPONENTS = os.environ.get("BIOHUB_OUTPUT_KEEP_DIVISION_COMPONENTS", "1") != "0"
+ADAPTIVE_SHORT_TRACK_RESCUE = os.environ.get("BIOHUB_ADAPTIVE_SHORT_TRACK_RESCUE", "0") != "0"
+SHORT_TRACK_RESCUE_TRIGGER_REMOVED_FRAC = float(os.environ.get("BIOHUB_SHORT_TRACK_RESCUE_TRIGGER_REMOVED_FRAC", "0.10"))
+SHORT_TRACK_RESCUE_MIN_LEN = int(os.environ.get("BIOHUB_SHORT_TRACK_RESCUE_MIN_LEN", "4"))
+SHORT_TRACK_RESCUE_MIN_MEAN_EDGE_PROB = float(os.environ.get("BIOHUB_SHORT_TRACK_RESCUE_MIN_MEAN_EDGE_PROB", "0.82"))
+SHORT_TRACK_RESCUE_MAX_MEAN_EDGE_DIST_UM = float(os.environ.get("BIOHUB_SHORT_TRACK_RESCUE_MAX_MEAN_EDGE_DIST_UM", "3.25"))
+SHORT_TRACK_RESCUE_MAX_NODES_FRAC = float(os.environ.get("BIOHUB_SHORT_TRACK_RESCUE_MAX_NODES_FRAC", "0.018"))
+SHORT_TRACK_RESCUE_MAX_NODES_ABS = int(os.environ.get("BIOHUB_SHORT_TRACK_RESCUE_MAX_NODES_ABS", "180"))
+
+# 线拟合平滑：沿“唯一父亲 / 唯一子细胞”的链取前后各 ≤ 2 帧（至少 3 个点），对 z、y、x 分别拟合直线，
+# 新位置 = 0.2 × 原位置 + 0.8 × 拟合值。细胞在几帧内近似匀速运动，平滑能压低单帧的定位噪声；只改坐标、不改连接。
+OUTPUT_LINEFIT_SMOOTH = os.environ.get("BIOHUB_OUTPUT_LINEFIT_SMOOTH", "1") != "0"
+OUTPUT_LINEFIT_WEIGHT = float(os.environ.get("BIOHUB_OUTPUT_LINEFIT_WEIGHT", "0.8"))
+OUTPUT_LINEFIT_WINDOW = int(os.environ.get("BIOHUB_OUTPUT_LINEFIT_WINDOW", "2"))
+
+# 严格两帧缺口恢复：总距离 ≤ 10.2 µm、平均每步 ≤ 4.4 µm；REQUIRE_CONTEXT = 1：断点的上一步或续点的下一步中
+# 至少有一侧与插值步一致（夹角余弦 > −0.25 且两步向量之差 ≤ 6 µm），两侧都没有已知运动的配对直接放弃；
+# 候选按“距离 + 2 × 方向惩罚”从小到大贪心选取，总量 ≤ min(180, 边数 × 0.45%)，每帧 ≤ 该帧轨迹终点数 × 0.6%（至少 1）。
+OUTPUT_GAP2_RECOVERY = os.environ.get("BIOHUB_OUTPUT_GAP2_RECOVERY", "0") != "0"
+GAP2_MAX_TOTAL_UM = float(os.environ.get("BIOHUB_GAP2_MAX_TOTAL_UM", "10.2"))
+GAP2_MAX_STEP_UM = float(os.environ.get("BIOHUB_GAP2_MAX_STEP_UM", "4.4"))
+GAP2_MAX_LINKS_FRAC = float(os.environ.get("BIOHUB_GAP2_MAX_LINKS_FRAC", "0.0045"))
+GAP2_MAX_LINKS_ABS = int(os.environ.get("BIOHUB_GAP2_MAX_LINKS_ABS", "180"))
+GAP2_REQUIRE_CONTEXT = os.environ.get("BIOHUB_GAP2_REQUIRE_CONTEXT", "1") != "0"
+GAP2_FRAME_FRAC_CAP = float(os.environ.get("BIOHUB_GAP2_FRAME_FRAC_CAP", "0.006"))
+
+# 安全分裂（原理与生效值见第 0 段）。REQUIRE_DIVERGENCE：要求两姐妹在下一帧继续分开；
+# REQUIRE_MUTUAL_NN：名字叫“互为最近邻”，代码里实际是单向的——候选 B 必须是离已有子细胞 A 最近的无父节点。
+OUTPUT_SAFE_DIVISIONS = os.environ.get("BIOHUB_OUTPUT_SAFE_DIVISIONS", "1") != "0"
+SAFE_DIV_MAX_UM = float(os.environ.get("BIOHUB_SAFE_DIV_MAX_UM", "4.7"))
+SAFE_DIV_SISTER_MAX_UM = float(os.environ.get("BIOHUB_SAFE_DIV_SISTER_MAX_UM", "7.2"))
+SAFE_DIV_SISTER_SYMMETRY_TAU = float(os.environ.get("BIOHUB_SAFE_DIV_SISTER_SYMMETRY_TAU", "0.0"))
+SAFE_DIV_EXISTING_CHILD_MAX_UM = float(os.environ.get("BIOHUB_SAFE_DIV_EXISTING_CHILD_MAX_UM", "7.8"))
+SAFE_DIV_FRAME_FRAC_CAP = float(os.environ.get("BIOHUB_SAFE_DIV_FRAME_FRAC_CAP", "0.008"))
+SAFE_DIV_GLOBAL_FRAC_CAP = float(os.environ.get("BIOHUB_SAFE_DIV_GLOBAL_FRAC_CAP", "0.004"))
+
+
+SAFE_DIV_DIVERGE_UM = float(os.environ.get("BIOHUB_SAFE_DIV_DIVERGE_UM", "2.25"))
+SAFE_DIV_REQUIRE_DIVERGENCE = os.environ.get("BIOHUB_SAFE_DIV_REQUIRE_DIVERGENCE", "1") != "0"
+SAFE_DIV_REQUIRE_MUTUAL_NN = os.environ.get("BIOHUB_SAFE_DIV_REQUIRE_MUTUAL_NN", "1") != "0"
+
+
+# DeepCenter 否决的常量。打分方式：把点映射到热图网格（y/x 方向池化 4 倍，与 z 同为 1.625 µm 一格），
+# 取 z ±1、y/x ±2 格（3×5×5）窗口内的最大值与阈值比较——取窗口最大值是为了容忍几 µm 的位置误差。
+# 热图按帧缓存（SCORE_CACHE_MAX_FRAMES，第 5 段会把它调到 128）。
+USE_DEEPCENTER_VETO = os.environ.get("BIOHUB_USE_DEEPCENTER_VETO", "1") != "0"
+REQUIRE_DEEPCENTER_VETO = os.environ.get("BIOHUB_REQUIRE_DEEPCENTER_VETO", "1") != "0"
+DEEPCENTER_MANIFEST_DEFAULT = os.environ.get(
+    "BIOHUB_DEEPCENTER_MANIFEST_DEFAULT",
+    "/kaggle/input/datasets/pilkwang/biohub-deepcenter-unet3d-center-prior-v1/ARTIFACT_MANIFEST.json",
+)
+DEEPCENTER_CHECKPOINT_DEFAULT = os.environ.get(
+    "BIOHUB_DEEPCENTER_CHECKPOINT_DEFAULT",
+    "/kaggle/input/biohub-deepcenter-unet3d-center-prior-v1/weights/full_frame_center/best.pt",
+)
+DEEPCENTER_RELATIVE = os.environ.get("BIOHUB_DEEPCENTER_RELATIVE", "weights/full_frame_center/best.pt")
+DEEPCENTER_GAP_VETO = os.environ.get("BIOHUB_DEEPCENTER_GAP_VETO", "1") != "0"
+DEEPCENTER_SAFE_DIV_VETO = os.environ.get("BIOHUB_DEEPCENTER_SAFE_DIV_VETO", "1") != "0"
+DEEPCENTER_GAP_THRESHOLD = float(os.environ.get("BIOHUB_DEEPCENTER_GAP_THRESHOLD", "0.10"))
+DEEPCENTER_EXPECTED_EPOCH = int(os.environ.get("BIOHUB_DEEPCENTER_EXPECTED_EPOCH", "0"))
+DEEPCENTER_GAP_CONFIRM_MIN_SPAN_UM = float(os.environ.get("BIOHUB_DEEPCENTER_GAP_CONFIRM_MIN_SPAN_UM", "0"))
+DEEPCENTER_SAFE_DIV_THRESHOLD = float(os.environ.get("BIOHUB_DEEPCENTER_SAFE_DIV_THRESHOLD", "0.12"))
+DEEPCENTER_SCORE_WIN_Z = int(os.environ.get("BIOHUB_DEEPCENTER_SCORE_WIN_Z", "1"))
+DEEPCENTER_SCORE_WIN_YX = int(os.environ.get("BIOHUB_DEEPCENTER_SCORE_WIN_YX", "2"))
+DEEPCENTER_SCORE_CACHE_MAX_FRAMES = int(os.environ.get("BIOHUB_DEEPCENTER_SCORE_CACHE_MAX_FRAMES", "8"))
+
+# 把全部生效配置打印出来，便于在运行日志里核对；gap_close_effective_max_gap 是单帧缺口闭合实际的最大缺口（1）。
+CONFIG_DISPLAY = {
+    "experiment_tag": EXPERIMENT_TAG,
+    "method": METHOD,
+    "weights": WEIGHTS_RELATIVE,
+    "target_artifact_slug": TARGET_ARTIFACT_SLUG,
+    "primary_artifact_manifest": str(PRIMARY_ARTIFACT_MANIFEST),
+    "allow_artifact_fallback": ALLOW_ARTIFACT_FALLBACK,
+    "det_threshold": DET_THRESHOLD,
+    "unet_batch_size": UNET_BATCH_SIZE,
+    "use_ilp": USE_ILP,
+    "ilp_edge_weight": ILP_EDGE_WEIGHT,
+    "ilp_appearance_weight": ILP_APPEARANCE_WEIGHT,
+    "ilp_disappearance_weight": ILP_DISAPPEARANCE_WEIGHT,
+    "ilp_division_weight": ILP_DIVISION_WEIGHT,
+    "slice": SLICE,
+    "allow_pip_install": ALLOW_PIP_INSTALL,
+    "output_edge_max_um": OUTPUT_EDGE_MAX_UM,
+    "output_enforce_next_frame": OUTPUT_ENFORCE_NEXT_FRAME,
+    "output_single_parent_repair": OUTPUT_SINGLE_PARENT_REPAIR,
+    "output_single_child_repair": OUTPUT_SINGLE_CHILD_REPAIR,
+    "output_prune_isolated": OUTPUT_PRUNE_ISOLATED,
+    "output_motion_relink": OUTPUT_MOTION_RELINK,
+    "motion_relink_tight_um": MOTION_RELINK_TIGHT_UM,
+    "motion_relink_relaxed_um": MOTION_RELINK_RELAXED_UM,
+    "motion_relink_velocity_weight": MOTION_RELINK_VELOCITY_WEIGHT,
+    "motion_relink_learned_bonus": MOTION_RELINK_LEARNED_BONUS,
+    "motion_relink_max_frame_nodes": MOTION_RELINK_MAX_FRAME_NODES,
+    "output_division_geometry_filter": OUTPUT_DIVISION_GEOMETRY_FILTER,
+    "div_parent_max_um": DIV_PARENT_MAX_UM,
+    "div_sister_max_um": DIV_SISTER_MAX_UM,
+    "div_drop_to_single_if_bad": DIV_DROP_TO_SINGLE_IF_BAD,
+    "output_gap_close": OUTPUT_GAP_CLOSE,
+    "gap_close_max_gap": GAP_CLOSE_MAX_GAP,
+    "gap_close_effective_max_gap": min(GAP_CLOSE_MAX_GAP, 1),
+    "gap_close_um": GAP_CLOSE_UM,
+    "gap_density_adaptive": GAP_DENSITY_ADAPTIVE,
+    "gap_density_reference_um": GAP_DENSITY_REFERENCE_UM,
+    "gap_density_gain": GAP_DENSITY_GAIN,
+    "gap_density_max_step_delta_um": GAP_DENSITY_MAX_STEP_DELTA_UM,
+    "gap_density_neighbors": GAP_DENSITY_NEIGHBORS,
+    "gap_close_reuse_existing": GAP_CLOSE_REUSE_EXISTING,
+    "gap_close_reuse_um": GAP_CLOSE_REUSE_UM,
+    "gap_close_max_added_frac": GAP_CLOSE_MAX_ADDED_FRAC,
+    "gap_close_max_added_abs": GAP_CLOSE_MAX_ADDED_ABS,
+    "gap_refine_synthetic": GAP_REFINE_SYNTHETIC,
+    "gap_refine_win_z": GAP_REFINE_WIN_Z,
+    "gap_refine_win_yx": GAP_REFINE_WIN_YX,
+    "gap_refine_max_shift_um": GAP_REFINE_MAX_SHIFT_UM,
+    "output_filter_short_tracks": OUTPUT_FILTER_SHORT_TRACKS,
+    "output_min_track_len": OUTPUT_MIN_TRACK_LEN,
+    "output_keep_division_components": OUTPUT_KEEP_DIVISION_COMPONENTS,
+    "adaptive_short_track_rescue": ADAPTIVE_SHORT_TRACK_RESCUE,
+    "short_track_rescue_trigger_removed_frac": SHORT_TRACK_RESCUE_TRIGGER_REMOVED_FRAC,
+    "short_track_rescue_min_len": SHORT_TRACK_RESCUE_MIN_LEN,
+    "short_track_rescue_min_mean_edge_prob": SHORT_TRACK_RESCUE_MIN_MEAN_EDGE_PROB,
+    "short_track_rescue_max_mean_edge_dist_um": SHORT_TRACK_RESCUE_MAX_MEAN_EDGE_DIST_UM,
+    "short_track_rescue_max_nodes_frac": SHORT_TRACK_RESCUE_MAX_NODES_FRAC,
+    "short_track_rescue_max_nodes_abs": SHORT_TRACK_RESCUE_MAX_NODES_ABS,
+    "output_linefit_smooth": OUTPUT_LINEFIT_SMOOTH,
+    "output_linefit_weight": OUTPUT_LINEFIT_WEIGHT,
+    "output_linefit_window": OUTPUT_LINEFIT_WINDOW,
+    "output_gap2_recovery": OUTPUT_GAP2_RECOVERY,
+    "gap2_max_total_um": GAP2_MAX_TOTAL_UM,
+    "gap2_max_step_um": GAP2_MAX_STEP_UM,
+    "gap2_max_links_frac": GAP2_MAX_LINKS_FRAC,
+    "gap2_max_links_abs": GAP2_MAX_LINKS_ABS,
+    "gap2_require_context": GAP2_REQUIRE_CONTEXT,
+    "gap2_frame_frac_cap": GAP2_FRAME_FRAC_CAP,
+    "output_safe_divisions": OUTPUT_SAFE_DIVISIONS,
+    "safe_div_max_um": SAFE_DIV_MAX_UM,
+    "safe_div_sister_max_um": SAFE_DIV_SISTER_MAX_UM,
+    "safe_div_existing_child_max_um": SAFE_DIV_EXISTING_CHILD_MAX_UM,
+    "safe_div_frame_frac_cap": SAFE_DIV_FRAME_FRAC_CAP,
+    "safe_div_global_frac_cap": SAFE_DIV_GLOBAL_FRAC_CAP,
+    "use_deepcenter_add_only_gate": USE_DEEPCENTER_VETO,
+    "deepcenter_gap_add_gate": DEEPCENTER_GAP_VETO,
+    "deepcenter_safe_div_add_gate": DEEPCENTER_SAFE_DIV_VETO,
+    "deepcenter_gap_threshold": DEEPCENTER_GAP_THRESHOLD,
+    "deepcenter_expected_epoch": DEEPCENTER_EXPECTED_EPOCH,
+    "deepcenter_gap_confirm_min_span_um": DEEPCENTER_GAP_CONFIRM_MIN_SPAN_UM,
+    "deepcenter_safe_div_threshold": DEEPCENTER_SAFE_DIV_THRESHOLD,
+    "deepcenter_checkpoint_default": DEEPCENTER_CHECKPOINT_DEFAULT,
+}
+
+print("Biohub learned UNet + node-transformer + ILP submission")
+print("COMP_DIR:", COMP_DIR, "exists:", COMP_DIR.exists())
+print("TEST_DIR:", TEST_DIR, "exists:", TEST_DIR.exists())
+print(json.dumps(CONFIG_DISPLAY, indent=2, sort_keys=True))
+
+# ===== 第 3 段：离线依赖、推理代码与权重、完整性校验、副模型 =====
+# Kaggle 代码竞赛关闭网络：第三方包（tracksdata、zarr 3、pyscipopt（SCIP）、geff、ilpy、polars …）以 wheel
+# 形式放在挂载的支持包数据集里，用 pip --no-index --no-deps 离线安装。--no-deps 是为了不让 pip 顺手替换
+# 镜像自带的 numpy / scipy（在运行中的 kernel 里换二进制库容易出错），代价是依赖闭包要在
+# EXTRA_SPECS_BY_NAME 里手工列出。
+import re
+
+# 按变量名推测：用于选择 polars 的运行时变体，与下方额外安装的 polars-runtime-32 包配套（代码里没有说明具体语义）。
+os.environ.setdefault("POLARS_PREFER_PKG", "32")
+
+# PACKAGE_SPECS：导入名 → (模块名, pip 版本约束)。zarr 必须是 3.x（影像是 Zarr v3 格式）。
+# EXTRA_SPECS_BY_NAME：因为用了 --no-deps，每个包的依赖要在这里手工补全。
+PACKAGE_SPECS = {
+    "tracksdata": ("tracksdata", "tracksdata"),
+    "zarr": ("zarr", "zarr>=3.0.10,<4"),
+    "pyscipopt": ("pyscipopt", "pyscipopt"),
+    "geff": ("geff", "geff>=1.1.3.1.1"),
+    "geff_spec": ("geff_spec", "geff-spec<1.2"),
+    "ilpy": ("ilpy", "ilpy>=0.5.1"),
+    "polars": ("polars", "polars>=1.36"),
+    "blosc2": ("blosc2", "blosc2"),
+    "dask": ("dask", "dask"),
+    "imagecodecs": ("imagecodecs", "imagecodecs"),
+    "skimage": ("skimage", "scikit-image>=0.24"),
+    "pyarrow": ("pyarrow", "pyarrow"),
+    "rustworkx": ("rustworkx", "rustworkx>=0.17.1"),
+    "sqlalchemy": ("sqlalchemy", "sqlalchemy>=2"),
+    "numcodecs": ("numcodecs", "numcodecs>=0.13,<0.16"),
+    "donfig": ("donfig", "donfig>=0.8"),
+    "google_crc32c": ("google_crc32c", "google-crc32c>=1.5"),
+    "bidict": ("bidict", "bidict>=0.23.1"),
+    "psygnal": ("psygnal", "psygnal>=0.14"),
+    "rich": ("rich", "rich"),
+    "networkx": ("networkx", "networkx>=3.2.1"),
+    "pydantic": ("pydantic", "pydantic>=2.11"),
+    "pydantic_core": ("pydantic_core", "pydantic-core"),
+    "annotated_types": ("annotated_types", "annotated-types"),
+    "typing_extensions": ("typing_extensions", "typing-extensions>=4.13"),
+    "typing_inspection": ("typing_inspection", "typing-inspection"),
+    "markdown_it": ("markdown_it", "markdown-it-py"),
+    "pygments": ("pygments", "pygments"),
+    "click": ("click", "click"),
+    "cloudpickle": ("cloudpickle", "cloudpickle"),
+    "fsspec": ("fsspec", "fsspec"),
+    "partd": ("partd", "partd"),
+    "locket": ("locket", "locket"),
+    "toolz": ("toolz", "toolz"),
+    "yaml": ("yaml", "pyyaml"),
+    "ndindex": ("ndindex", "ndindex"),
+    "msgpack": ("msgpack", "msgpack"),
+    "numexpr": ("numexpr", "numexpr"),
+    "deprecated": ("deprecated", "deprecated"),
+    "wrapt": ("wrapt", "wrapt"),
+    "imageio": ("imageio", "imageio"),
+    "PIL": ("PIL", "pillow"),
+    "tifffile": ("tifffile", "tifffile"),
+    "lazy_loader": ("lazy_loader", "lazy-loader"),
+    "tqdm": ("tqdm", "tqdm"),
+}
+EXTRA_SPECS_BY_NAME = {
+    "tracksdata": ["bidict>=0.23.1", "psygnal>=0.14", "rich"],
+    "zarr": ["donfig>=0.8", "google-crc32c>=1.5", "numcodecs>=0.13,<0.16"],
+    "geff": ["geff-spec<1.2", "networkx>=3.2.1", "pydantic>=2.11", "numcodecs>=0.13,<0.16"],
+    "geff_spec": ["pydantic>=2.11", "annotated-types", "pydantic-core", "typing-inspection"],
+    "polars": ["polars-runtime-32"],
+    "dask": ["click", "cloudpickle", "fsspec", "partd", "pyyaml", "toolz"],
+    "partd": ["locket"],
+    "blosc2": ["ndindex", "msgpack", "numexpr"],
+    "numcodecs": ["deprecated", "msgpack", "wrapt"],
+    "rich": ["markdown-it-py", "pygments"],
+    "pydantic": ["annotated-types", "pydantic-core", "typing-extensions>=4.13", "typing-inspection"],
+    "skimage": ["imageio", "pillow", "tifffile", "lazy-loader", "networkx"],
+}
+PIP_DEPENDENCIES = [spec for _, spec in PACKAGE_SPECS.values()]
+REQUIRED_MODULES = {name: module for name, (module, _) in PACKAGE_SPECS.items() if module}
+# 旧版支持包，只有设置 BIOHUB_ALLOW_ARTIFACT_FALLBACK=1 调试时才会用到。
+FALLBACK_ARTIFACT_SLUGS = ["biohub-tracking-support-pack-v1"]
+
+
+
+# 与第 2 段重复的定义，值相同。
+ALLOW_PIP_INSTALL = os.environ.get("BIOHUB_ALLOW_PIP_INSTALL", "0") != "0"
+
+
+# ---- 支持包发现 ----
+# has_model_artifact：目录里要同时有推理代码（repo/ 或 repo.zip）和主权重（weights/ 或 weights.zip）。
+# artifact_matches_target：清单 artifact_name、目录名或路径中必须出现目标 slug，防止误用其他版本的支持包。
+def module_missing(module_name: str) -> bool:
+    return importlib.util.find_spec(module_name) is None
+
+
+def has_model_artifact(path: Path) -> bool:
+    has_repo_dir = (path / "repo").exists()
+    has_weights_dir = (path / "weights" / METHOD / "split_0" / "edge_predictor_best.pth").exists()
+    has_repo_zip = (path / "repo.zip").exists()
+    has_weights_zip = (path / "weights.zip").exists()
+    return (has_repo_dir and has_weights_dir) or (has_repo_zip and has_weights_zip)
+
+
+def artifact_manifest(path: Path) -> dict:
+    manifest = path / "ARTIFACT_MANIFEST.json"
+    if not manifest.exists():
+        return {}
+    try:
+        return json.loads(manifest.read_text())
+    except Exception:
+        return {}
+
+
+def artifact_matches_target(path: Path) -> bool:
+    if ALLOW_ARTIFACT_FALLBACK:
+        return True
+    manifest = artifact_manifest(path)
+    artifact_name = str(manifest.get("artifact_name", ""))
+    path_text = str(path)
+    return TARGET_ARTIFACT_SLUG in {artifact_name, path.name} or TARGET_ARTIFACT_SLUG in path_text
+
+
+# 同一个数据集在 Kaggle 上可能挂载在 /kaggle/input/datasets/<作者>/<slug>、/kaggle/input/<slug> 等位置，
+# 这里把几种可能都列出来；PublicNotebook/<slug> 是本地调试用的相对路径。
+def candidate_roots_for_slug(slug: str) -> list[Path]:
+    return [
+        Path(f"/kaggle/input/datasets/pilkwang/{slug}"),
+        Path(f"/kaggle/input/{slug}"),
+        Path(f"/kaggle/input/{slug}/{slug}"),
+        Path(f"PublicNotebook/{slug}"),
+    ]
+
+
+# 查找顺序：显式环境变量 → 清单默认路径 → 按 slug 推导的挂载路径 → 扫描 /kaggle/input 的子目录与孙目录；
+# 返回第一个同时含推理代码与主权重、且名称与目标 slug 一致的目录。找不到就报错并列出查过的路径。
+def find_artifacts_root() -> Path:
+    candidates: list[Path] = []
+    for env_name in ["BIOHUB_MODEL_ARTIFACTS", "BIOHUB_ARTIFACTS"]:
+        explicit = os.environ.get(env_name, "").strip()
+        if explicit:
+            candidates.append(Path(explicit))
+
+    candidates.append(PRIMARY_ARTIFACT_MANIFEST.parent)
+    candidates.extend(candidate_roots_for_slug(TARGET_ARTIFACT_SLUG))
+
+    if ALLOW_ARTIFACT_FALLBACK:
+        for slug in FALLBACK_ARTIFACT_SLUGS:
+            candidates.extend(candidate_roots_for_slug(slug))
+
+    input_root = Path("/kaggle/input")
+    if input_root.exists():
+        for child in input_root.iterdir():
+            if not child.is_dir():
+                continue
+            child_text = str(child)
+            if TARGET_ARTIFACT_SLUG in child_text or ALLOW_ARTIFACT_FALLBACK:
+                candidates.append(child)
+                candidates.append(child / child.name)
+                for grandchild in child.iterdir():
+                    if grandchild.is_dir():
+                        candidates.append(grandchild)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.expanduser()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if has_model_artifact(candidate) and artifact_matches_target(candidate):
+            return candidate
+    checked = "\n".join(str(path) for path in candidates[:80])
+    raise FileNotFoundError(
+        "Could not find the required model artifact. "
+        f"Expected slug: {TARGET_ARTIFACT_SLUG}\n"
+        "Attach the newly uploaded support dataset, or set BIOHUB_MODEL_ARTIFACTS.\n"
+        "To debug with an older artifact, set BIOHUB_ALLOW_ARTIFACT_FALLBACK=1.\n"
+        "Checked:\n" + checked
+    )
+
+
+# ---- 离线 wheel 目录：支持包的 wheels/、/kaggle/working，以及 /kaggle/input 下凡含 *.whl / *.tar.gz / *.zip 的目录 ----
+def _has_package_file(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    patterns = ("*.whl", "*.tar.gz", "*.zip")
+    return any(any(path.glob(pattern)) for pattern in patterns)
+
+
+def find_offline_package_dirs(artifacts: Path) -> list[Path]:
+    candidates: list[Path] = [
+        artifacts / "wheels",
+        artifacts,
+        Path("/kaggle/working"),
+        Path("/kaggle/working/wheels"),
+    ]
+    input_root = Path("/kaggle/input")
+    if input_root.exists():
+        for child in input_root.iterdir():
+            if child.is_dir():
+                candidates.extend([child / "wheels", child])
+                for grandchild in child.iterdir():
+                    if grandchild.is_dir():
+                        candidates.extend([grandchild / "wheels", grandchild])
+
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.expanduser()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if _has_package_file(candidate):
+            out.append(candidate)
+    return out
+
+
+# ---- 离线安装循环 ----
+# purge_imported_modules：装上新版本后把旧模块从 sys.modules 里清掉，下一次 import 才会加载新版本。
+def purge_imported_modules(package_names: list[str]) -> None:
+    roots = {"tracksdata"}
+    for name in package_names:
+        if name in PACKAGE_SPECS:
+            module = PACKAGE_SPECS[name][0]
+            roots.add(module.split(".")[0])
+        if name == "polars":
+            roots.add("polars")
+    for root in roots:
+        for module_name in list(sys.modules):
+            if module_name == root or module_name.startswith(root + "."):
+                sys.modules.pop(module_name, None)
+
+
+# Kaggle 镜像自带的 polars / zarr 可能版本过旧：polars 运行时不可用、或 zarr 主版本 < 3（读不了 Zarr v3 影像）时，
+# 即使能 import 也要强制重装。
+def polars_runtime_ready() -> bool:
+    try:
+        import polars as _pl
+        from polars._plr import PySeries as _PySeries
+
+        _ = _PySeries
+        return hasattr(_pl, "Float16") and _pl.Series([-999999.0], dtype=_pl.Float64).dtype == _pl.Float64
+    except Exception:
+        return False
+
+
+def packages_requiring_refresh() -> list[str]:
+    refresh: list[str] = []
+    if not module_missing("polars") and not polars_runtime_ready():
+        refresh.append("polars")
+
+    if not module_missing("zarr"):
+        try:
+            import zarr as _zarr
+            version_text = str(getattr(_zarr, "__version__", "0"))
+            major = int(version_text.split(".", 1)[0])
+            if major < 3:
+                refresh.append("zarr")
+        except Exception:
+            refresh.append("zarr")
+    return refresh
+
+
+# dependency_specs_for：把缺失的包连同手工依赖闭包转换成去重后的 pip 版本约束列表。
+# import_failures / missing_names_from_failures：真正 import 一遍，从报错信息里解析出还缺哪个模块。
+def dependency_specs_for(missing: list[str]) -> list[str]:
+    specs: list[str] = []
+    seen: set[str] = set()
+
+    def add(spec: str) -> None:
+        key = spec.lower()
+        if key not in seen:
+            seen.add(key)
+            specs.append(spec)
+
+    for name in missing:
+        if name in PACKAGE_SPECS:
+            add(PACKAGE_SPECS[name][1])
+        for spec in EXTRA_SPECS_BY_NAME.get(name, []):
+            add(spec)
+    return specs
+
+
+def import_failures() -> dict[str, str]:
+    failures: dict[str, str] = {}
+    for name, module_name in REQUIRED_MODULES.items():
+        try:
+            importlib.import_module(module_name)
+        except Exception as exc:
+            failures[name] = f"{type(exc).__name__}: {exc}"
+    return failures
+
+
+def missing_names_from_failures(failures: dict[str, str]) -> list[str]:
+    names: list[str] = []
+    module_to_name = {module: name for name, module in REQUIRED_MODULES.items()}
+    for message in failures.values():
+        match = re.search(r"No module named ['\"]([^'\"]+)['\"]", message)
+        if match:
+            module = match.group(1).split(".")[0]
+        else:
+            match = re.search(r"module ['\"]([^'\"]+)['\"] has no attribute", message)
+            if not match:
+                continue
+            module = match.group(1).split(".")[0]
+        name = module_to_name.get(module)
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+# install_missing_dependencies：先离线安装（--no-index --no-deps；polars / zarr 要加 --force-reinstall 覆盖旧版本）；
+# 只有 ALLOW_PIP_INSTALL = 1 才尝试联网安装；都失败就报错，并给出手工安装命令。
+def install_missing_dependencies(missing: list[str], artifacts: Path) -> None:
+    specs = dependency_specs_for(missing)
+    force_reinstall = bool({"polars", "zarr"} & set(missing))
+    if not specs:
+        return
+
+    package_dirs = find_offline_package_dirs(artifacts)
+    if package_dirs:
+        offline_cmd = [sys.executable, "-m", "pip", "install", "--no-index", "--no-deps"]
+        if force_reinstall:
+            offline_cmd.append("--force-reinstall")
+        for package_dir in package_dirs:
+            offline_cmd.extend(["--find-links", str(package_dir)])
+        offline_cmd.extend(specs)
+        print("Installing missing packages from offline package dirs:", missing)
+        print("Dependency resolver is disabled with --no-deps to avoid replacing Kaggle numpy/scipy in a live kernel.")
+        print("Offline package dirs:", [str(path) for path in package_dirs])
+        result = subprocess.run(offline_cmd, text=True, capture_output=True)
+        if result.returncode == 0:
+            purge_imported_modules(missing)
+            print("Offline dependency install succeeded.")
+            return
+        print("Offline dependency install failed. Last pip output:")
+        print((result.stdout or "")[-2000:])
+        print((result.stderr or "")[-2000:])
+
+    if ALLOW_PIP_INSTALL:
+        online_cmd = [sys.executable, "-m", "pip", "install", "--no-deps"]
+        if force_reinstall:
+            online_cmd.append("--force-reinstall")
+        online_cmd.extend(specs)
+        print("Installing missing packages from PyPI:", missing)
+        result = subprocess.run(online_cmd, text=True, capture_output=True)
+        if result.returncode == 0:
+            purge_imported_modules(missing)
+            print("PyPI dependency install succeeded.")
+            return
+        print("PyPI dependency install failed. Last pip output:")
+        print((result.stdout or "")[-2000:])
+        print((result.stderr or "")[-2000:])
+
+    command = "pip install tracksdata zarr>=3.0.10,<4 pyscipopt geff geff-spec ilpy polars blosc2 dask imagecodecs pyarrow rustworkx sqlalchemy donfig numcodecs"
+    raise ImportError(
+        "Missing required packages or dependency wheels: " + ", ".join(missing) + "\n"
+        "Attach the support dataset with offline wheels. If supplying Kaggle dependency input instead, use:\n"
+        + command + "\n"
+        "Do not quote zarr>=3.0.10,<4 in Kaggle dependency input."
+    )
+
+
+# ensure_dependencies：最多 5 轮“检查 → 安装”：先刷新过旧的包，再装缺失的包，最后真正 import 验证。
+# 每装一次都重新检查，因为装上一个包可能暴露出它的下一个缺失依赖。
+def ensure_dependencies(artifacts: Path) -> None:
+    for _ in range(5):
+        refresh = packages_requiring_refresh()
+        if refresh:
+            install_missing_dependencies(refresh, artifacts)
+            continue
+
+        missing = [pkg for pkg, module in REQUIRED_MODULES.items() if module_missing(module)]
+        if missing:
+            install_missing_dependencies(missing, artifacts)
+            continue
+
+        failures = import_failures()
+        if not failures:
+            print("Required graph/Zarr/ILP packages import successfully.")
+            return
+
+        missing_from_import = missing_names_from_failures(failures)
+        if missing_from_import:
+            install_missing_dependencies(missing_from_import, artifacts)
+            continue
+
+        raise ImportError(
+            "Required packages are present but failed to import. "
+            "This may indicate a binary dependency mismatch in the live notebook kernel. "
+            "Keep Kaggle dependency input empty and attach the wheels artifact.\n"
+            + json.dumps(failures, indent=2)
+        )
+
+    failures = import_failures()
+    raise ImportError(
+        "Dependency recovery did not converge after repeated offline installs. "
+        "The attached support artifact may be missing wheels.\n"
+        + json.dumps(failures, indent=2)
+    )
+
+
+# ---- 物化推理代码与权重 ----
+# 把支持包中的推理代码复制到可写的 /kaggle/working/tracking_repo（/kaggle/input 只读，第 4 段要在原地给
+# 预测脚本打补丁）；权重目录尽量用软链接，避免复制大文件。
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def copy_or_extract_tree(src_dir: Path, src_zip: Path, dst: Path) -> None:
+    remove_path(dst)
+    if src_dir.exists() and src_dir.is_dir():
+        shutil.copytree(src_dir, dst)
+        return
+    if src_zip.exists() and src_zip.is_file():
+        dst.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(src_zip) as zf:
+            zf.extractall(dst)
+        return
+    raise FileNotFoundError(f"Missing source tree or zip: {src_dir} / {src_zip}")
+
+
+def link_or_copy_tree(src: Path, dst: Path) -> None:
+    remove_path(dst)
+    try:
+        os.symlink(src, dst, target_is_directory=True)
+    except Exception:
+        shutil.copytree(src, dst)
+
+
+def materialize_inference_repo(artifacts: Path) -> None:
+    copy_or_extract_tree(artifacts / "repo", artifacts / "repo.zip", REPO_DIR)
+
+    weights_src = artifacts / "weights"
+    weights_zip = artifacts / "weights.zip"
+    weights_dst = REPO_DIR / "weights"
+    if weights_src.exists() and weights_src.is_dir():
+        link_or_copy_tree(weights_src, weights_dst)
+    elif weights_zip.exists() and weights_zip.is_file():
+        remove_path(weights_dst)
+        weights_dst.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(weights_zip) as zf:
+            zf.extractall(weights_dst)
+    else:
+        raise FileNotFoundError(f"Missing weights tree or zip under {artifacts}")
+
+    required = [
+        REPO_DIR / "scripts" / "predict_unet_transformer.py",
+        REPO_DIR / WEIGHTS_RELATIVE,
+    ]
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        raise FileNotFoundError("Materialized inference repo is incomplete:\n" + "\n".join(missing))
+    print("Inference repo:", REPO_DIR)
+    print("Weights:", REPO_DIR / WEIGHTS_RELATIVE)
+
+
+# 执行：定位支持包 → 核对清单里主权重的 SHA256 → 安装依赖 → 物化推理代码。
+ARTIFACTS = find_artifacts_root()
+print("ARTIFACTS:", ARTIFACTS)
+print("Has offline wheels:", (ARTIFACTS / "wheels").exists())
+manifest_info = artifact_manifest(ARTIFACTS)
+if manifest_info:
+    print("Artifact name:", manifest_info.get("artifact_name"))
+    print("Weight sha256:", manifest_info.get("model", {}).get("weight_sha256"))
+    print("Weight path:", manifest_info.get("model", {}).get("weight_path"))
+    _expected_primary_sha256 = "12f6881ee3620a831697ca098ff8f48e687a24225f4e048b538deec3562fe771"
+    _actual_primary_sha256 = str(manifest_info.get("model", {}).get("weight_sha256", ""))
+    if _actual_primary_sha256 != _expected_primary_sha256:
+        raise RuntimeError(
+            "Primary model checksum mismatch: "
+            f"expected {_expected_primary_sha256}, got {_actual_primary_sha256 or 'missing'}"
+        )
+
+ensure_dependencies(ARTIFACTS)
+materialize_inference_repo(ARTIFACTS)
+
+
+
+
+# ---- 完整性校验 ----
+# 支持包中的 .py 必须恰好是这 13 个、且逐个 SHA256 一致；整体清单哈希、主模型与 DeepCenter 权重的哈希也必须一致。
+# 原理：第 4 段用“精确字符串锚点”改写预测脚本，上游代码哪怕改一个字符，补丁都可能错位或静默失效；
+# 先校验、再打补丁，才能保证隐藏集重跑与保存运行时的行为完全一致。
+# 注意：tracking_repo 下不能多出任何 .py（第 4 段写坐标头模块文件是在这次校验之后）。
+import hashlib as _integrity_hashlib
+
+_support_expected_sha256 = {
+    "scripts/augmentations.py": "13db09817bf492f8d0f710a0a4d09776320b262060167055090a303fc6057f4e",
+    "scripts/dataspec.py": "e69bf952fb985477ac50ff8598a35020c95d20a035a09b81ab4056e655dd311f",
+    "scripts/evaluate.py": "614813cc51c3581c6ccda4bb20725a19da8ecac4a27620654bfca58319cffa3c",
+    "scripts/predict_unet_transformer.py": "c44e771ba5980b820f93091e03a303c25dfe8f3232e501f54dc9565731c234b9",
+    "scripts/train_unet_transformer.py": "c4f6317736bb3bb1ec8f3f6e9a6d935a463e3f0f1f685481b2d13218d35dc9ea",
+    "src/biohub_tracking/__init__.py": "26a18d8da84e40da73281a48ebc3017d847a2e57431ab63e8629d2109e6e8571",
+    "src/biohub_tracking/division_metrics.py": "d1cf1e0a43009d02174f1699ce2aa28458a2220ac4b521731d3bcf31cf8c76be",
+    "src/biohub_tracking/img_proc.py": "00e8ef0adc8b39f1aaaa547ea6197b906bf9e8c009e339d3e95f8f8dbf31be3f",
+    "src/biohub_tracking/io.py": "efae135b088cecaab463d889f16c885ef6da3ad27b0747327d8ddc28d866b7bd",
+    "src/biohub_tracking/metrics.py": "31baf45b54c78f68bab4f65dd8f4b38bca702abb644171c6df7c46cdeef55d83",
+    "src/biohub_tracking/models/__init__.py": "ab7587ef79856bae50d24b62e5805092d0459ee1c586522b763f9ef70c093e1d",
+    "src/biohub_tracking/models/simple_node_transformer.py": "b97209edeb03840e80d903e3e2a8c81c520641c8ef343f6ca2904d0f80db064e",
+    "src/biohub_tracking/models/temporal_unet.py": "d809c35d42f504161074ddeaaa7aee5b407e5bca7f9b4e1d5f9b2ff345666cac"
+}
+_support_expected_manifest_sha256 = "978b626d1fd1e7397435a437dfe68691defe1572fc3c20e61012d7c9b52ed029"
+_primary_expected_sha256 = "12f6881ee3620a831697ca098ff8f48e687a24225f4e048b538deec3562fe771"
+_deepcenter_expected_sha256 = "8040999a92f6b7bbd98fa8cf458141e045c0f9ad7c936bdb3b18e1f7edafe2a0"  
+
+
+def _integrity_sha256_file(path: Path) -> str:
+    digest = _integrity_hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+_support_materialized_paths = {
+    path.relative_to(REPO_DIR).as_posix(): path
+    for path in REPO_DIR.rglob("*.py")
+}
+_support_actual_names = set(_support_materialized_paths)
+_support_expected_names = set(_support_expected_sha256)
+if _support_actual_names != _support_expected_names:
+    raise RuntimeError({
+        "support_repo_python_files_missing": sorted(
+            _support_expected_names - _support_actual_names
+        ),
+        "support_repo_python_files_extra": sorted(
+            _support_actual_names - _support_expected_names
+        ),
+    })
+_support_actual_sha256 = {
+    relative: _integrity_sha256_file(_support_materialized_paths[relative])
+    for relative in sorted(_support_materialized_paths)
+}
+if _support_actual_sha256 != _support_expected_sha256:
+    raise RuntimeError({
+        "support_repo_python_checksum_mismatch": {
+            relative: {
+                "expected": _support_expected_sha256[relative],
+                "actual": _support_actual_sha256[relative],
+            }
+            for relative in sorted(_support_expected_sha256)
+            if _support_actual_sha256[relative]
+            != _support_expected_sha256[relative]
+        }
+    })
+# 清单哈希：把“<sha256>  <相对路径>\n”按路径排序后拼接，再整体求一次 SHA256（与 sha256sum 的输出格式相同）。
+_support_manifest_bytes = "".join(
+    f"{_support_actual_sha256[relative]}  {relative}\n"
+    for relative in sorted(_support_actual_sha256)
+).encode("utf-8")
+_support_actual_manifest_sha256 = _integrity_hashlib.sha256(
+    _support_manifest_bytes
+).hexdigest()
+if _support_actual_manifest_sha256 != _support_expected_manifest_sha256:
+    raise RuntimeError(
+        "Support repo manifest checksum mismatch: "
+        f"expected {_support_expected_manifest_sha256}, "
+        f"got {_support_actual_manifest_sha256}"
+    )
+
+# 物化后的主权重文件再校验一次（软链接或解压都可能出问题）。
+_primary_materialized_path = REPO_DIR / WEIGHTS_RELATIVE
+_primary_actual_sha256 = _integrity_sha256_file(_primary_materialized_path)
+if _primary_actual_sha256 != _primary_expected_sha256:
+    raise RuntimeError(
+        "Materialized primary model checksum mismatch: "
+        f"expected {_primary_expected_sha256}, got {_primary_actual_sha256}"
+    )
+
+# DeepCenter 权重查找顺序：第 0 段设置的环境变量 → 经典挂载路径 → 带作者名的挂载路径；
+# 第一个存在的文件校验 SHA256 后，把实际路径写回环境变量，供第 5 段加载。
+_deepcenter_candidate_strings = [
+    os.environ.get("BIOHUB_DEEPCENTER_CHECKPOINT", "").strip(),
+    "/kaggle/input/biohub-deepcenter-unet3d-center-prior-v1/weights/"
+    "full_frame_center/best.pt",
+    "/kaggle/input/datasets/pilkwang/biohub-deepcenter-unet3d-center-prior-v1/"
+    "weights/full_frame_center/best.pt",
+]
+_deepcenter_candidates = []
+for _candidate_string in _deepcenter_candidate_strings:
+    if not _candidate_string:
+        continue
+    _candidate_path = Path(_candidate_string)
+    if _candidate_path not in _deepcenter_candidates:
+        _deepcenter_candidates.append(_candidate_path)
+_deepcenter_materialized_path = next(
+    (path for path in _deepcenter_candidates if path.is_file()),
+    None,
+)
+if _deepcenter_materialized_path is None:
+    raise FileNotFoundError({
+        "missing_deepcenter_checkpoint": [str(path) for path in _deepcenter_candidates]
+    })
+_deepcenter_actual_sha256 = _integrity_sha256_file(
+    _deepcenter_materialized_path
+)
+if _deepcenter_actual_sha256 != _deepcenter_expected_sha256:
+    raise RuntimeError(
+        "DeepCenter checkpoint checksum mismatch: "
+        f"expected {_deepcenter_expected_sha256}, "
+        f"got {_deepcenter_actual_sha256}"
+    )
+os.environ["BIOHUB_DEEPCENTER_CHECKPOINT"] = str(
+    _deepcenter_materialized_path
+)
+
+print("Support repo Python manifest SHA256:", _support_actual_manifest_sha256)
+print("Primary materialized SHA256:", _primary_actual_sha256)
+print("DeepCenter materialized SHA256:", _deepcenter_actual_sha256)
+
+
+
+# ---- 副模型（双模型融合）----
+# 副模型与主模型结构相同（窗口长度与降采样倍数必须一致，第 4 段的补丁会检查），是另一次独立训练
+# （另一个随机种子，即数据集名里的 seed314159）。两个模型的误差不完全相关，融合能降低方差。
+# 查找时以权重的 SHA256 为准而不是路径：先试几个已知路径，都找不到时才遍历整个 /kaggle/input。
+import hashlib as _hashlib
+
+_secondary_manifest_explicit = Path(os.environ.get(
+    "BIOHUB_SECONDARY_ARTIFACT_MANIFEST",
+    "/kaggle/input/datasets/pilkwang/biohub-temporal-unet3d-seed314159-v1/ARTIFACT_MANIFEST.json",
+))
+_secondary_expected_sha256 = "9bac2fa0dadc4a6fc1899e0caf187f4b553e0a7cd90ba1261a68b35ffe9e305f"
+_secondary_slug = "biohub-temporal-unet3d-seed314159-v1"
+
+
+import itertools as _itertools
+
+
+def _find_secondary_artifact_root() -> tuple[Path, dict]:
+    candidates = [
+        _secondary_manifest_explicit,
+        Path(f"/kaggle/input/{_secondary_slug}/ARTIFACT_MANIFEST.json"),
+        Path(f"/kaggle/input/datasets/pilkwang/{_secondary_slug}/ARTIFACT_MANIFEST.json"),
+    ]
+    input_root = Path("/kaggle/input")
+
+    def _walk_input_root():
+        # 遍历 /kaggle/input 下的全部文件（包括竞赛的训练数据目录）在可见集运行中花了约 210 s，
+        # 所以只在上面的显式路径都没找到时才做。
+        if input_root.exists():
+            yield from input_root.rglob("ARTIFACT_MANIFEST.json")
+
+    seen = set()
+    for manifest_path in _itertools.chain(candidates, _walk_input_root()):
+        manifest_path = manifest_path.expanduser()
+        if manifest_path in seen or not manifest_path.is_file():
+            continue
+        seen.add(manifest_path)
+        try:
+            info = json.loads(manifest_path.read_text())
+        except Exception:
+            continue
+        sha256 = str(info.get("model", {}).get("weight_sha256", ""))
+        if sha256 == _secondary_expected_sha256:
+            return manifest_path.parent, info
+    raise FileNotFoundError(
+        "Could not find the independent-seed artifact with weight SHA256 "
+        + _secondary_expected_sha256
+    )
+
+
+# 把副模型权重复制（或解压）到 /kaggle/working/secondary_seed_weights，并检查权重文件与 config.json 都在。
+SECONDARY_ARTIFACTS, secondary_manifest_info = _find_secondary_artifact_root()
+SECONDARY_WEIGHTS_ROOT = WORKING_DIR / "secondary_seed_weights"
+copy_or_extract_tree(
+    SECONDARY_ARTIFACTS / "weights",
+    SECONDARY_ARTIFACTS / "weights.zip",
+    SECONDARY_WEIGHTS_ROOT,
+)
+SECONDARY_WEIGHTS_PATH = (
+    SECONDARY_WEIGHTS_ROOT
+    / "unet_transformer"
+    / "split_0"
+    / "edge_predictor_best.pth"
+)
+SECONDARY_CONFIG_PATH = SECONDARY_WEIGHTS_PATH.parent / "config.json"
+for _required_secondary_path in (SECONDARY_WEIGHTS_PATH, SECONDARY_CONFIG_PATH):
+    if not _required_secondary_path.is_file():
+        raise FileNotFoundError(f"Missing secondary model file: {_required_secondary_path}")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = _hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+# 复制后的权重文件再校验一次 SHA256。
+_secondary_actual_sha256 = _sha256_file(SECONDARY_WEIGHTS_PATH)
+if _secondary_actual_sha256 != _secondary_expected_sha256:
+    raise RuntimeError(
+        "Secondary model checksum mismatch: "
+        f"expected {_secondary_expected_sha256}, got {_secondary_actual_sha256}"
+    )
+
+# 双模型融合参数（由推理子进程读取，见第 4 段的补丁）：
+#   检测：logit = 0.2 × 主模型 + 0.8 × 副模型。副模型的 logit 先按整帧均值 / 标准差对齐到主模型的尺度
+#     （尺度比截断在 [0.5, 2]），两者都做多视角 TTA；融合后某帧峰数不足主模型的 90% 时该帧回退主模型（保留率守卫）。
+#   关联（low_margin_consensus）：对每个 t+1 细胞，只有两个模型选出的最佳父亲相同、且主模型拿不准
+#     （第一、二名概率差 < 0.35）时才混入副模型的 logit，混入权重 = 0.15 × (0.35 − 差值) / 0.35；
+#     主模型很确定、或两个模型意见不一时，完全相信主模型。MIX_TEMPERATURE = 1 表示不做温度缩放。
+#   候选阈值 0.48：融合后 p 超过 0.48 的边才进入 ILP。p 是对每个 t+1 细胞的全部候选父亲做 softmax 得到的，
+#     概率和为 1，所以每个细胞最多 2 个候选父亲能过线，送进 ILP 的候选图因此很稀疏、求解很快。
+os.environ["BIOHUB_SECONDARY_WEIGHTS"] = str(SECONDARY_WEIGHTS_PATH)
+os.environ["BIOHUB_SECONDARY_EDGE_WEIGHT"] = "0.15"
+print("Secondary artifact:", SECONDARY_ARTIFACTS)
+print("Secondary weight:", SECONDARY_WEIGHTS_PATH)
+print("Secondary SHA256:", _secondary_actual_sha256)
+print("Secondary edge-logit weight:", os.environ["BIOHUB_SECONDARY_EDGE_WEIGHT"])
+
+os.environ["BIOHUB_SECONDARY_DETECTION_WEIGHT"] = "0.80"  
+os.environ["BIOHUB_SECONDARY_LINK_MODE"] = "low_margin_consensus"
+os.environ["BIOHUB_SECONDARY_MIX_TEMPERATURE"] = "1"
+os.environ["BIOHUB_SECONDARY_LOW_MARGIN_MAX"] = "0.35"
+os.environ["BIOHUB_DUAL_SEED_EDGE_THRESHOLD"] = "0.48"
+
+# 运行时完整性收据：把所有文件与权重的哈希、实际路径写成 JSON；"ground_truth_accessed": False 声明
+# 推理过程没有读取任何标签。纯记录，不影响结果。
+_runtime_integrity_receipt = {
+    "status": "complete_label_free_runtime_integrity",
+    "verified_before_dynamic_source_patch": True,
+    "support_repo_python_file_count": len(_support_actual_sha256),
+    "support_repo_python_sha256": _support_actual_sha256,
+    "support_repo_python_manifest_sha256": _support_actual_manifest_sha256,
+    "checkpoint_sha256": {
+        "primary": _primary_actual_sha256,
+        "secondary": _secondary_actual_sha256,
+        "deepcenter": _deepcenter_actual_sha256,
+    },
+    "materialized_paths": {
+        "primary": str(_primary_materialized_path),
+        "secondary": str(SECONDARY_WEIGHTS_PATH),
+        "deepcenter": str(_deepcenter_materialized_path),
+    },
+    "ground_truth_accessed": False,
+}
+_runtime_integrity_receipt_path = (
+    WORKING_DIR / "bidirectional_production_runtime_integrity.json"
+)
+_runtime_integrity_receipt_path.write_text(
+    json.dumps(_runtime_integrity_receipt, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+print("Runtime integrity receipt:", _runtime_integrity_receipt_path)
+
+
+# ===== 第 4 段：给推理脚本打补丁，在 GPU 子进程中完成检测、坐标修正、关联与 ILP =====
+# 本段做两件事：
+#   (1) 用“查找-替换源码”的方式，给支持包里的推理脚本 scripts/predict_unet_transformer.py 打 13 组补丁；
+#   (2) 以子进程（有 2 块 GPU 时分两片并行）运行补丁后的脚本：读影像 → 3D U-Net 编码 → 找细胞中心（检测）
+#       → 坐标修正 → 给相邻两帧的细胞对打“是同一个细胞”的概率（关联）→ ILP 全局求解。每段影像输出一张原始轨迹图
+#       （.geff），同时留下“低分峰”和“稠密候选概率”两份缓存，供第 5 段起的后处理使用。
+# 推理脚本在第 3 段已经过 SHA256 校验，确认是公开原版；本段只在运行时往里注入改动，不改任何权重。
+# 每个补丁都要求锚点文本在脚本中恰好出现 1 次，否则立即报错，避免补丁静默失效（例外：补丁 1、7 找不到锚点时只打印
+#   警告，补丁 10 的失败被当作非致命，见各自的说明）；替换后一般先 compile() 检查语法，再写回文件
+#   （补丁 1 和补丁 11 例外，替换后直接写回、不单独 compile；它们写入的内容会在下一个补丁 compile 整个脚本时一并检查）。
+# 重要：后面的补丁常以前面补丁写入的文本为锚点（例如补丁 13 的锚点是补丁 12 写入的一行英文注释），
+#   所以补丁字符串内部一个字都不能改（包括其中的英文注释）；本教学版的中文注释全部写在字符串外面。
+# 补丁一览：
+#   1 检测 8 视角 TTA        2 双模型融合              3 逐帧保留率守卫          4 双向调和关联
+#   5 检测坐标清单（诊断）   6 ILP 限时                7 逐影像计时（诊断）      8/9 主/副模型的特征 TTA 与关联特征修正
+#   10 保存低分峰            11 坐标修正（10 折坐标头）12 稠密候选概率缓存      13 关联特征修正的第二份关联概率
+# 其中 1–7、10 与公开基线相同；8/9 中的关联特征修正、11 中的 10 折平均、12、13 是本方案新增的。
+
+# ---- 检查 GPU ----
+# 每个滑窗、每个模型要做约 9 次 3D U-Net 前向（8 个视角 + 关联特征修正的 1 个额外视角），两个模型一起只有 GPU
+# 才能在比赛 12 小时的时限内跑完全部影像。
+import torch as _torch
+
+if not _torch.cuda.is_available():
+    raise RuntimeError(
+        "CUDA GPU is required for this notebook. Enable a Kaggle GPU accelerator and commit again."
+    )
+print("CUDA device:", _torch.cuda.get_device_name(0))
+
+
+# ---- 补丁 1：检测 8 视角 TTA（测试时增强）----
+# 原理：细胞在 y-x 平面内没有固定朝向，检测器应当对平面内的翻转、旋转“等变”。把输入做几种 y-x 变换后分别前向，
+#   输出再逆变换回原坐标，在 logit 上取平均：单次前向的随机误差被平均掉，热图更平滑，峰的位置更稳定。
+# 只变换 y、x，不翻 z。支持包原注释给出的理由是：数据高度各向异性（原始 z 分辨率比 y/x 粗约 4 倍），
+#   翻 z 会得到训练中没见过的输入。
+# 支持包原版（_old）是 4 个视角：原图、x 翻、y 翻、xy 翻，除以 4。这里（_new）扩成 8 个：再加 rot90(k=1)、
+#   rot90(k=3)、转置、“先 rot90 再转置”，最后除以视角数 _nv = 8。
+# 一个细节：“先 rot90(k=1) 再转置”在数学上恰好等于 x 翻转，与第 2 个视角重复，所以检测端实际只有 7 个不同视角、
+#   x 翻转的权重加倍。真正缺的第 8 种对称（反对角转置）由后面的“关联特征修正”补上，而且只用于关联（补丁 8、9、13）。
+# 打印文字里的 "D4-style" 指正方形的二面体对称群 D4（4 种旋转 × 是否翻转 = 8 种变换）。
+# 锚点找不到时这里只打印警告，但补丁 2、补丁 8 都以 _new 的文本为锚点，所以实际上会在后面报错。
+_ps = REPO_DIR / "scripts" / "predict_unet_transformer.py"
+_s = _ps.read_text()
+_old = """        if cfg.det_tta:
+            tta_flips = [(-1,), (-2,), (-2, -1)]
+            for dims in tta_flips:
+                imgs_flip = imgs.flip(dims)
+                _, det_flip = model.encode(imgs_flip)
+                for f in range(W):
+                    det_logits[f] = det_logits[f] + det_flip[f].flip(dims)
+                del imgs_flip, det_flip
+            for f in range(W):
+                det_logits[f] = det_logits[f] / 4"""
+_new = """        if cfg.det_tta:
+            _nv = 1
+            for dims in [(-1,), (-2,), (-2, -1)]:
+                imgs_flip = imgs.flip(dims)
+                _, det_flip = model.encode(imgs_flip)
+                for f in range(W):
+                    det_logits[f] = det_logits[f] + det_flip[f].flip(dims)
+                del imgs_flip, det_flip
+                _nv += 1
+            for _k in (1, 3):
+                imgs_rot = torch.rot90(imgs, _k, dims=(-2, -1))
+                _, det_rot = model.encode(imgs_rot)
+                for f in range(W):
+                    det_logits[f] = det_logits[f] + torch.rot90(det_rot[f], -_k, dims=(-2, -1))
+                del imgs_rot, det_rot
+                _nv += 1
+            imgs_t = imgs.transpose(-1, -2)
+            _, det_t = model.encode(imgs_t)
+            for f in range(W):
+                det_logits[f] = det_logits[f] + det_t[f].transpose(-1, -2)
+            del imgs_t, det_t
+            _nv += 1
+            imgs_at = torch.rot90(imgs, 1, dims=(-2, -1)).transpose(-1, -2)
+            _, det_at = model.encode(imgs_at)
+            for f in range(W):
+                det_logits[f] = det_logits[f] + torch.rot90(det_at[f].transpose(-1, -2), -1, dims=(-2, -1))
+            del imgs_at, det_at
+            _nv += 1
+            for f in range(W):
+                det_logits[f] = det_logits[f] / _nv"""
+if _old in _s:
+    _ps.write_text(_s.replace(_old, _new))
+    print("TTA patch applied (400ep spatial D4-style)")
+else:
+    print("TTA WARNING: block not found - using default 4-way")
+
+
+# ---- 补丁 2：双模型融合（结构相同、随机种子不同的两个模型）----
+# 原理：不同种子训练出的模型犯错不完全相同，把两者融合相当于一个小型集成，能降低方差。
+# 下面列表共 6 处替换（每处的锚点必须恰好出现 1 次）。关键参数来自第 3 段设置的环境变量：
+#   检测融合中副模型权重 0.80；关联融合权重 0.15、模式 low_margin_consensus、低置信门限 0.35；候选边阈值 0.48。
+_s = _ps.read_text()
+_ensemble_replacements = [
+    # (1) predict_video 的函数签名增加副模型及其融合参数（默认值等于“不用副模型”）。
+    ('    downsample: tuple[int, ...] = (1, 4, 4),\n) -> tuple[np.ndarray, list[tuple[int, int, float, float]]]:', '    downsample: tuple[int, ...] = (1, 4, 4),\n    secondary_model: UNetNodeTransformer | None = None,\n    secondary_edge_weight: float = 0.0,\n    secondary_detection_weight: float = 0.0,\n    secondary_link_mode: str = "raw",\n    secondary_mix_temperature: float = 1.0,\n    secondary_low_margin_max: float = 0.2,\n) -> tuple[np.ndarray, list[tuple[int, int, float, float]]]:'),
+    # (2) 检测融合：副模型同样做 8 视角 TTA。两个模型的 logit 量纲不同，直接平均会被量纲大的一方主导，
+    #     所以先把副模型 logit 按整帧的均值 / 标准差对齐到主模型（缩放比截断在 [0.5, 2]，防止极端缩放），
+    #     再按 (1 − 0.8) × 主 + 0.8 × 副 加权。
+    ('            for f in range(W):\n                det_logits[f] = det_logits[f] / _nv\n\n        del imgs', '            for f in range(W):\n                det_logits[f] = det_logits[f] / _nv\n\n        secondary_unet_out = None\n        if secondary_model is not None:\n            secondary_unet_out, secondary_det_logits = secondary_model.encode(imgs)\n\n            if secondary_detection_weight > 0.0:\n                if cfg.det_tta:\n                    _secondary_nv = 1\n                    for dims in [(-1,), (-2,), (-2, -1)]:\n                        secondary_imgs_flip = imgs.flip(dims)\n                        _, secondary_det_flip = secondary_model.encode(secondary_imgs_flip)\n                        for f in range(W):\n                            secondary_det_logits[f] = (\n                                secondary_det_logits[f] + secondary_det_flip[f].flip(dims)\n                            )\n                        del secondary_imgs_flip, secondary_det_flip\n                        _secondary_nv += 1\n                    for _k in (1, 3):\n                        secondary_imgs_rot = torch.rot90(imgs, _k, dims=(-2, -1))\n                        _, secondary_det_rot = secondary_model.encode(secondary_imgs_rot)\n                        for f in range(W):\n                            secondary_det_logits[f] = secondary_det_logits[f] + torch.rot90(\n                                secondary_det_rot[f], -_k, dims=(-2, -1)\n                            )\n                        del secondary_imgs_rot, secondary_det_rot\n                        _secondary_nv += 1\n                    secondary_imgs_t = imgs.transpose(-1, -2)\n                    _, secondary_det_t = secondary_model.encode(secondary_imgs_t)\n                    for f in range(W):\n                        secondary_det_logits[f] = (\n                            secondary_det_logits[f] + secondary_det_t[f].transpose(-1, -2)\n                        )\n                    del secondary_imgs_t, secondary_det_t\n                    _secondary_nv += 1\n                    secondary_imgs_at = torch.rot90(\n                        imgs, 1, dims=(-2, -1)\n                    ).transpose(-1, -2)\n                    _, secondary_det_at = secondary_model.encode(secondary_imgs_at)\n                    for f in range(W):\n                        secondary_det_logits[f] = secondary_det_logits[f] + torch.rot90(\n                            secondary_det_at[f].transpose(-1, -2),\n                            -1,\n                            dims=(-2, -1),\n                        )\n                    del secondary_imgs_at, secondary_det_at\n                    _secondary_nv += 1\n                    for f in range(W):\n                        secondary_det_logits[f] = secondary_det_logits[f] / _secondary_nv\n\n                for f in range(W):\n                    primary_det = det_logits[f]\n                    secondary_det = secondary_det_logits[f]\n                    primary_mean = primary_det.mean()\n                    secondary_mean = secondary_det.mean()\n                    primary_scale = primary_det.float().std(unbiased=False).clamp_min(1e-4)\n                    secondary_scale = secondary_det.float().std(unbiased=False).clamp_min(1e-4)\n                    scale_ratio = (primary_scale / secondary_scale).clamp(0.5, 2.0)\n                    secondary_det_aligned = (\n                        (secondary_det - secondary_mean) * scale_ratio + primary_mean\n                    )\n                    det_logits[f] = (\n                        (1.0 - secondary_detection_weight) * primary_det\n                        + secondary_detection_weight * secondary_det_aligned\n                    )\n\n            del secondary_det_logits\n\n        del imgs'),
+    # (3) 关联融合（本管线用 low_margin_consensus，即“副模型低置信一致融合”）：副模型的关联 logit 先按每个目标细胞
+    #     （每一列）的均值 / 标准差对齐到主模型；对每个 t+1 帧细胞，取主模型在候选父亲上做 softmax 后前两名之差 m，
+    #     混入权重 = 0.15 × clip((0.35 − m) / 0.35, 0, 1)，并且只有两个模型的首选父亲相同时才混入，否则为 0。
+    #     也就是说，副模型只在“主模型拿不准、两个模型意见又一致”的难例上帮忙，不会稀释主模型已经很有把握的判断。
+    ('            edge_logits_pair = model.predict_edges(\n                unet_feat_src, unet_feat_tgt,\n                p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,\n                p_pos_src, p_pos_tgt,\n                p_mask_src, p_mask_tgt,\n            )  # (1, n_src, n_tgt)\n\n            raw = edge_logits_pair[0]', '            edge_logits_pair = model.predict_edges(\n                unet_feat_src, unet_feat_tgt,\n                p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,\n                p_pos_src, p_pos_tgt,\n                p_mask_src, p_mask_tgt,\n            )  # (1, n_src, n_tgt)\n\n            if secondary_model is not None:\n                if secondary_unet_out is None:\n                    raise RuntimeError("Secondary model is loaded but its feature map is missing")\n                secondary_feat_src = secondary_model._index_features(\n                    secondary_unet_out[:, f_idx], p_coords_src, p_mask_src,\n                )\n                secondary_feat_tgt = secondary_model._index_features(\n                    secondary_unet_out[:, f_idx + 1], p_coords_tgt, p_mask_tgt,\n                )\n                secondary_logits_pair = secondary_model.predict_edges(\n                    secondary_feat_src, secondary_feat_tgt,\n                    p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,\n                    p_pos_src, p_pos_tgt,\n                    p_mask_src, p_mask_tgt,\n                )\n\n                if secondary_link_mode == "raw":\n                    secondary_for_mix = secondary_logits_pair\n                    blend_weight = secondary_edge_weight\n                elif secondary_link_mode in {\n                    "calibrated", "adaptive", "low_margin_consensus"\n                }:\n                    primary_center = edge_logits_pair.mean(dim=1, keepdim=True)\n                    primary_scale = edge_logits_pair.float().std(\n                        dim=1, keepdim=True, unbiased=False\n                    ).clamp_min(1e-4)\n                    secondary_center = secondary_logits_pair.mean(dim=1, keepdim=True)\n                    secondary_scale = secondary_logits_pair.float().std(\n                        dim=1, keepdim=True, unbiased=False\n                    ).clamp_min(1e-4)\n                    secondary_scale_ratio = (primary_scale / secondary_scale).clamp(0.5, 2.0)\n                    secondary_for_mix = (\n                        (secondary_logits_pair - secondary_center) * secondary_scale_ratio\n                        + primary_center\n                    )\n                    if secondary_link_mode == "calibrated":\n                        blend_weight = secondary_edge_weight\n                    elif secondary_link_mode == "adaptive":\n                        if n_src >= 2:\n                            primary_probs = torch.softmax(edge_logits_pair[0], dim=0)\n                            secondary_probs = torch.softmax(secondary_for_mix[0], dim=0)\n                            primary_top2 = torch.topk(primary_probs, k=2, dim=0)\n                            secondary_top2 = torch.topk(secondary_probs, k=2, dim=0)\n                            primary_margin = primary_top2.values[0] - primary_top2.values[1]\n                            secondary_margin = secondary_top2.values[0] - secondary_top2.values[1]\n                            local_weight = (\n                                secondary_edge_weight + secondary_margin - primary_margin\n                            ).clamp(0.15, 0.75)\n                            same_parent = primary_top2.indices[0].eq(\n                                secondary_top2.indices[0]\n                            )\n                            local_weight = torch.where(\n                                same_parent,\n                                torch.maximum(\n                                    local_weight,\n                                    torch.full_like(local_weight, secondary_edge_weight),\n                                ),\n                                local_weight,\n                            )\n                            blend_weight = local_weight.view(1, 1, -1)\n                        else:\n                            blend_weight = secondary_edge_weight\n                    else:\n                        if n_src >= 2:\n                            primary_probs = torch.softmax(edge_logits_pair[0], dim=0)\n                            secondary_probs = torch.softmax(secondary_for_mix[0], dim=0)\n                            primary_top2 = torch.topk(primary_probs, k=2, dim=0)\n                            secondary_top2 = torch.topk(secondary_probs, k=2, dim=0)\n                            primary_margin = primary_top2.values[0] - primary_top2.values[1]\n                            same_parent = primary_top2.indices[0].eq(\n                                secondary_top2.indices[0]\n                            )\n                            uncertainty = (\n                                (secondary_low_margin_max - primary_margin)\n                                / secondary_low_margin_max\n                            ).clamp(0.0, 1.0)\n                            local_weight = secondary_edge_weight * uncertainty\n                            local_weight = torch.where(\n                                same_parent,\n                                local_weight,\n                                torch.zeros_like(local_weight),\n                            )\n                            blend_weight = local_weight.view(1, 1, -1)\n                        else:\n                            blend_weight = 0.0\n                else:\n                    raise ValueError(f"Unsupported secondary link mode: {secondary_link_mode}")\n\n                edge_logits_pair = (\n                    (1.0 - blend_weight) * edge_logits_pair\n                    + blend_weight * secondary_for_mix\n                )\n                if secondary_mix_temperature != 1.0:\n                    mixed_center = edge_logits_pair.mean(dim=1, keepdim=True)\n                    edge_logits_pair = mixed_center + (\n                        edge_logits_pair - mixed_center\n                    ) / secondary_mix_temperature\n\n            raw = edge_logits_pair[0]'),
+    # (4) 每个滑窗结束时，连同副模型的特征图一起释放显存。
+    ('        del unet_out\n', '        del unet_out\n        if secondary_unet_out is not None:\n            del secondary_unet_out\n'),
+    # (5) 在 predict() 中加载副模型：校验各参数的取值范围、两个模型的滑窗长度与降采样网格一致，并把候选边阈值
+    #     cfg.threshold 改为 0.48。关联概率是对“每个 t+1 帧细胞的全部候选父亲”做 softmax（每列和为 1），
+    #     所以阈值 0.48 意味着每个细胞最多只有 2 个候选父亲能进入 ILP（3 个都超过 0.48 时和会大于 1）。
+    ('    model, window_size, downsample = load_model(weights_path, device)\n    print(', '    model, window_size, downsample = load_model(weights_path, device)\n\n    secondary_model = None\n    secondary_weights_text = os.environ.get("BIOHUB_SECONDARY_WEIGHTS", "").strip()\n    secondary_edge_weight = float(os.environ.get("BIOHUB_SECONDARY_EDGE_WEIGHT", "0"))\n    secondary_detection_weight = float(\n        os.environ.get("BIOHUB_SECONDARY_DETECTION_WEIGHT", "0")\n    )\n    secondary_link_mode = os.environ.get("BIOHUB_SECONDARY_LINK_MODE", "raw").strip()\n    secondary_mix_temperature = float(\n        os.environ.get("BIOHUB_SECONDARY_MIX_TEMPERATURE", "1")\n    )\n    secondary_low_margin_max = float(\n        os.environ.get("BIOHUB_SECONDARY_LOW_MARGIN_MAX", "0.2")\n    )\n    edge_candidate_threshold = float(\n        os.environ.get("BIOHUB_DUAL_SEED_EDGE_THRESHOLD", str(cfg.threshold))\n    )\n    if secondary_weights_text:\n        if not 0.0 < secondary_edge_weight < 1.0:\n            raise ValueError("BIOHUB_SECONDARY_EDGE_WEIGHT must be strictly between 0 and 1")\n        if not 0.0 <= secondary_detection_weight < 1.0:\n            raise ValueError(\n                "BIOHUB_SECONDARY_DETECTION_WEIGHT must be in the half-open interval [0, 1)"\n            )\n        if secondary_link_mode not in {\n            "raw", "calibrated", "adaptive", "low_margin_consensus"\n        }:\n            raise ValueError(\n                "BIOHUB_SECONDARY_LINK_MODE must be raw, calibrated, adaptive, "\n                "or low_margin_consensus"\n            )\n        if not 0.5 <= secondary_mix_temperature <= 2.0:\n            raise ValueError("BIOHUB_SECONDARY_MIX_TEMPERATURE must be in [0.5, 2.0]")\n        if not 0.0 < edge_candidate_threshold < 1.0:\n            raise ValueError("BIOHUB_DUAL_SEED_EDGE_THRESHOLD must be strictly between 0 and 1")\n        if not 0.0 < secondary_low_margin_max <= 1.0:\n            raise ValueError("BIOHUB_SECONDARY_LOW_MARGIN_MAX must be in (0, 1]")\n        secondary_model, secondary_window_size, secondary_downsample = load_model(\n            Path(secondary_weights_text), device,\n        )\n        if secondary_window_size != window_size or secondary_downsample != downsample:\n            raise ValueError(\n                "Primary and secondary models have incompatible inference grids: "\n                f"primary=(window={window_size}, downsample={downsample}), "\n                f"secondary=(window={secondary_window_size}, downsample={secondary_downsample})"\n            )\n        cfg.threshold = edge_candidate_threshold\n        print(\n            f"Secondary model: {secondary_weights_text} | "\n            f"edge weight={secondary_edge_weight:.3f} | "\n            f"detection weight={secondary_detection_weight:.3f} | "\n            f"link mode={secondary_link_mode} | "\n            f"temperature={secondary_mix_temperature:.3f} | "\n            f"low-margin max={secondary_low_margin_max:.3f} | "\n            f"edge threshold={cfg.threshold:.3f}",\n            flush=True,\n        )\n\n    print('),
+    # (6) 调用 predict_video 时把副模型及其参数传进去。
+    ('                unet_batch_size=unet_batch_size,\n                downsample=downsample,\n            )', '                unet_batch_size=unet_batch_size,\n                downsample=downsample,\n                secondary_model=secondary_model,\n                secondary_edge_weight=secondary_edge_weight,\n                secondary_detection_weight=secondary_detection_weight,\n                secondary_link_mode=secondary_link_mode,\n                secondary_mix_temperature=secondary_mix_temperature,\n                secondary_low_margin_max=secondary_low_margin_max,\n            )'),
+]
+for _patch_index, (_ensemble_old, _ensemble_new) in enumerate(
+    _ensemble_replacements, start=1
+):
+    _ensemble_count = _s.count(_ensemble_old)
+    if _ensemble_count != 1:
+        raise RuntimeError(
+            f'Calibrated dual-seed patch {_patch_index} expected one match, '
+            f'found {_ensemble_count}'
+        )
+    _s = _s.replace(_ensemble_old, _ensemble_new, 1)
+compile(_s, str(_ps), 'exec')
+_ps.write_text(_s)
+print('Calibrated dual-seed runtime patch applied')
+
+
+
+# ---- 补丁 3：逐帧保留率守卫 ----
+# 原理：漏检一个细胞会连带丢掉它进出的两条边，轨迹也在这里断开，代价远大于多出一个假峰。融合后的热图在个别帧上可能峰数骤减
+#   （例如副模型在这一帧表现差），守卫是召回的安全网。
+# 做法：在补丁 2 的检测融合处，每帧分别用“主模型单独”和“融合结果”按正式阈值数峰；若 融合峰数 / 主模型峰数 < 0.90，
+#   这一帧退回主模型的检测，否则用融合结果。每帧的判定（只在第一次处理该帧时）追加到 /kaggle/working/retention_guard_<分片>.jsonl，
+#   第 6 段会逐条审计这些记录（必须恰好覆盖全部测试影像、没有重复帧），所以这里先删掉旧的记录文件。
+os.environ["BIOHUB_DUAL_SEED_MIN_CANDIDATE_RETENTION"] = "0.90"
+for _guard_old_log in WORKING_DIR.glob("retention_guard_*.jsonl"):
+    _guard_old_log.unlink()
+
+_s = _ps.read_text()
+_guard_old = """                    det_logits[f] = (
+                        (1.0 - secondary_detection_weight) * primary_det
+                        + secondary_detection_weight * secondary_det_aligned
+                    )"""
+_guard_new = """                    blended_det = (
+                        (1.0 - secondary_detection_weight) * primary_det
+                        + secondary_detection_weight * secondary_det_aligned
+                    )
+                    primary_candidates = len(_detect_cells_pooled(
+                        primary_det[0],
+                        int(frame_indices[f]),
+                        cfg.det_threshold,
+                        pool_k,
+                    ))
+                    blended_candidates = len(_detect_cells_pooled(
+                        blended_det[0],
+                        int(frame_indices[f]),
+                        cfg.det_threshold,
+                        pool_k,
+                    ))
+                    minimum_retention = float(os.environ.get(
+                        "BIOHUB_DUAL_SEED_MIN_CANDIDATE_RETENTION",
+                        "0.90",
+                    ))
+                    candidate_retention = (
+                        blended_candidates / primary_candidates
+                        if primary_candidates
+                        else 1.0
+                    )
+                    use_primary_detection = bool(
+                        primary_candidates > 0
+                        and candidate_retention < minimum_retention
+                    )
+                    det_logits[f] = (
+                        primary_det if use_primary_detection else blended_det
+                    )
+                    if int(frame_indices[f]) not in seen_frames:
+                        shard = os.environ.get(
+                            "BIOHUB_GPU_SHARD", "single"
+                        ).replace("/", "_")
+                        guard_log = (
+                            Path("/kaggle/working")
+                            / f"retention_guard_{shard}.jsonl"
+                        )
+                        guard_record = {
+                            "dataset": ds_path.stem,
+                            "frame": int(frame_indices[f]),
+                            "primary_candidates": int(primary_candidates),
+                            "blended_candidates": int(blended_candidates),
+                            "retention": float(candidate_retention),
+                            "minimum_retention": float(minimum_retention),
+                            "use_primary": bool(use_primary_detection),
+                        }
+                        with guard_log.open("a") as guard_handle:
+                            guard_handle.write(
+                                json.dumps(guard_record, sort_keys=True)
+                                + "\\n"
+                            )
+                        if use_primary_detection:
+                            print(
+                                "BIOHUB_RETENTION_GUARD "
+                                + json.dumps(guard_record, sort_keys=True),
+                                flush=True,
+                            )"""
+_guard_matches = _s.count(_guard_old)
+if _guard_matches != 1:
+    raise RuntimeError(
+        f"Retention guard expected one blend block, found {_guard_matches}"
+    )
+_s = _s.replace(_guard_old, _guard_new, 1)
+compile(_s, str(_ps), "exec")
+_ps.write_text(_s)
+print(
+    "Frozen frame retention guard applied at "
+    + os.environ["BIOHUB_DUAL_SEED_MIN_CANDIDATE_RETENTION"]
+)
+
+
+
+# ---- 补丁 4：双向调和关联（权重 w = 0.15）----
+# 原理：真正的“同一个细胞”从两个时间方向看都应当成立。正向：以 t 帧细胞为源、t+1 帧为目标打分；反向：交换两帧的
+#   角色再打一次分，转置回 (源, 目标)。反向 logit 先按每个目标列的均值 / 标准差对齐到正向；两个方向各自在候选父亲
+#   维度做 softmax 得 p_f、p_r，再取加权调和平均 p = 1 / ((1 − w) / p_f + w / p_r)，并按列重新归一化。
+# 调和平均由较小者主导：只要有一个方向几乎否定，这个候选就会被明显压低（要求双向互相支持）。
+# 最后把 log p 按列缩放回正向 logit 的均值和尺度，使下游的 0.48 阈值与 ILP 的含义保持不变。
+# 它插在副模型融合之前，所以补丁 2 里的“前两名之差”是在调和之后的主模型 logit 上算的。
+# 补丁字符串中的英文注释 "Biohub 145: ..." 是公开流水线的版本标记，原样保留。
+# 下面的守卫要求环境变量恰为 0.15：权重写错时宁可报错，也不悄悄改变结果（防止配置漂移）。
+import math as _bidirectional_math
+
+_bidirectional_weight_guard = float(
+    os.environ.get("BIOHUB_BIDIRECTIONAL_EDGE_WEIGHT", "0")
+)
+if not _bidirectional_math.isclose(
+    _bidirectional_weight_guard, 0.15, rel_tol=0.0, abs_tol=1e-12
+):
+    raise ValueError({
+        "expected_bidirectional_weight": 0.15,
+        "actual_bidirectional_weight": _bidirectional_weight_guard,
+    })
+
+_s = _ps.read_text()
+_bi_old = '            edge_logits_pair = model.predict_edges(\n                unet_feat_src, unet_feat_tgt,\n                p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,\n                p_pos_src, p_pos_tgt,\n                p_mask_src, p_mask_tgt,\n            )  # (1, n_src, n_tgt)\n\n            if secondary_model is not None:\n'
+_bi_new = '            edge_logits_pair = model.predict_edges(\n                unet_feat_src, unet_feat_tgt,\n                p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,\n                p_pos_src, p_pos_tgt,\n                p_mask_src, p_mask_tgt,\n            )  # (1, n_src, n_tgt)\n\n            _bidirectional_weight = float(\n                os.environ.get("BIOHUB_BIDIRECTIONAL_EDGE_WEIGHT", "0")\n            )\n            if _bidirectional_weight > 0.0:\n                reverse_logits_native = model.predict_edges(\n                    unet_feat_tgt, unet_feat_src,\n                    p_coords_tgt * ds_arr_t, p_coords_src * ds_arr_t,\n                    p_pos_tgt, p_pos_src,\n                    p_mask_tgt, p_mask_src,\n                )  # (1, n_tgt, n_src)\n                reverse_logits_pair = reverse_logits_native.transpose(1, 2)\n\n                forward_center = edge_logits_pair.mean(dim=1, keepdim=True)\n                forward_scale = edge_logits_pair.float().std(\n                    dim=1, keepdim=True, unbiased=False\n                ).clamp_min(1e-4)\n                reverse_center = reverse_logits_pair.mean(dim=1, keepdim=True)\n                reverse_scale = reverse_logits_pair.float().std(\n                    dim=1, keepdim=True, unbiased=False\n                ).clamp_min(1e-4)\n                reverse_scale_ratio = (forward_scale / reverse_scale).clamp(0.5, 2.0)\n                reverse_scale_ratio = reverse_scale_ratio.to(reverse_logits_pair.dtype)\n                reverse_aligned = (\n                    (reverse_logits_pair - reverse_center) * reverse_scale_ratio\n                    + forward_center\n                )\n                # Biohub 145: require mutual forward/reverse support in probability space.\n                # The harmonic mean penalizes a candidate when either temporal direction\n                # assigns it very low probability, while calibration preserves the forward\n                # logit scale used by the unchanged downstream candidate threshold and ILP.\n                forward_prob = torch.softmax(edge_logits_pair.float(), dim=1).clamp_min(1e-8)\n                reverse_prob = torch.softmax(reverse_aligned.float(), dim=1).clamp_min(1e-8)\n                harmonic_prob = 1.0 / (\n                    (1.0 - _bidirectional_weight) / forward_prob\n                    + _bidirectional_weight / reverse_prob\n                )\n                harmonic_prob = harmonic_prob / harmonic_prob.sum(\n                    dim=1, keepdim=True\n                ).clamp_min(1e-8)\n                harmonic_logits = torch.log(harmonic_prob.clamp_min(1e-8))\n                harmonic_center = harmonic_logits.mean(dim=1, keepdim=True)\n                harmonic_scale = harmonic_logits.std(\n                    dim=1, keepdim=True, unbiased=False\n                ).clamp_min(1e-4)\n                harmonic_scale_ratio = (forward_scale / harmonic_scale).clamp(0.5, 2.0)\n                edge_logits_pair = (\n                    (harmonic_logits - harmonic_center) * harmonic_scale_ratio\n                    + forward_center\n                ).to(reverse_aligned.dtype)\n                del (\n                    reverse_logits_native,\n                    reverse_logits_pair,\n                    reverse_aligned,\n                    forward_prob,\n                    reverse_prob,\n                    harmonic_prob,\n                    harmonic_logits,\n                )\n            if secondary_model is not None:\n'
+_bi_count = _s.count(_bi_old)
+if _bi_count != 1:
+    raise RuntimeError(
+        f"Bidirectional edge patch expected one transformed block, found {_bi_count}"
+    )
+_s = _s.replace(_bi_old, _bi_new, 1)
+
+# ---- 补丁 5：ILP 之前的检测坐标清单（仅诊断）----
+# BIOHUB_DIAGNOSTIC_ARM 非空时，把每段影像检测坐标的 sha256 与逐帧数量追加到
+#   /kaggle/working/detector_coordinates_<arm>_<分片>.jsonl，用来核对两次运行的检测是否完全一致；不影响任何输出。
+# 替换文本原样保留了 "coords = coords.astype(np.int16)" 和 "return coords, all_edges" 两行，补丁 11、12 还要以它们为锚点。
+_coordinate_manifest_old = '    coords = coords.astype(np.int16)\n    return coords, all_edges'
+_coordinate_manifest_new = '    coords = coords.astype(np.int16)\n\n    # Label-free, pre-ILP detector-coordinate manifest. This executes inside\n    # predict_video, before build_graph and the ILP call in predict().\n    _coordinate_manifest_arm = os.environ.get(\n        "BIOHUB_DIAGNOSTIC_ARM", ""\n    ).strip()\n    if _coordinate_manifest_arm:\n        import hashlib as _coordinate_hashlib\n\n        _coordinate_shard = os.environ.get(\n            "BIOHUB_GPU_SHARD", "single"\n        ).replace("/", "_")\n        _coordinate_array = np.ascontiguousarray(\n            coords.astype("<i2", copy=False)\n        )\n        _coordinate_frame_counts = [\n            [int(_coordinate_t), int((_coordinate_array[:, 0] == _coordinate_t).sum())]\n            for _coordinate_t in np.unique(_coordinate_array[:, 0])\n        ]\n        _coordinate_record = {\n            "columns": ["t", "z", "y", "x"],\n            "coordinate_sha256": _coordinate_hashlib.sha256(\n                _coordinate_array.tobytes(order="C")\n            ).hexdigest(),\n            "dataset": ds_path.stem,\n            "dtype": "<i2",\n            "frame_counts": _coordinate_frame_counts,\n            "rows": int(len(_coordinate_array)),\n            "stage": "post_detection_pre_graph_pre_ilp",\n        }\n        _coordinate_manifest_path = (\n            Path("/kaggle/working")\n            / f"detector_coordinates_{_coordinate_manifest_arm}_"\n            f"{_coordinate_shard}.jsonl"\n        )\n        with _coordinate_manifest_path.open("a") as _coordinate_handle:\n            _coordinate_handle.write(\n                json.dumps(_coordinate_record, sort_keys=True) + "\\n"\n            )\n\n    return coords, all_edges'
+_coordinate_manifest_count = _s.count(_coordinate_manifest_old)
+if _coordinate_manifest_count != 1:
+    raise RuntimeError(
+        "Coordinate-manifest patch expected one pre-return block, found "
+        f"{_coordinate_manifest_count}"
+    )
+_s = _s.replace(
+    _coordinate_manifest_old, _coordinate_manifest_new, 1
+)
+
+# ---- 补丁 6：ILP 全局求解加时间上限，并打印耗时 ----
+# ILP（整数线性规划，tracksdata + SCIP）把整段影像的全部候选节点（概率 > 0.965 的检测）和候选边（p > 0.48）
+#   放在一起，一次性选出最优的节点与边：每个细胞最多 1 个父亲、最多 2 个子细胞。贪心逐对匹配处理不好的冲突
+#   （例如两个细胞抢同一个父亲），全局求解可以一并权衡。
+# 本文件能确定的只有传给 tracksdata.solvers.ILPSolver 的四个权重：边 −1.0 × edge_prob、出现 0.0、消失 2.0、分裂 0.4。
+#   按 tracksdata 对这些权重的通常含义，目标函数约为
+#   −1 × Σ(选中边的 p) + 0 × 新轨迹数（出现）+ 2 × 轨迹结束数（消失）+ 0.4 × 分裂数（求解器内部细节不在本文件里）。
+#   粗略地说，一条链的边概率之和要超过消失成本 2 才值得保留，所以 ILP 会主动丢掉短而弱的链（在公开基线配置下实测，
+#   每段影像丢掉 3%～39% 的检测），之后由后处理的“找回”收回其中一部分。
+# 支持包原版对整张图求解、不限时；这里用 BIOHUB_ILP_TIMEOUT_S（每段影像 1200 s）限时：按原代码注释的说法，到时 SCIP 返回
+#   当前找到的最优可行解，tracksdata 只记一条警告、不报错，保证全部影像在比赛 12 小时上限内跑完。求解外面包着
+#   suppress_output()，这条警告在日志里通常看不到；要判断是否超时，看下面打印的 ILP 耗时是否接近 1200 s。
+_ilp_old = (
+    '            solver = td.solvers.ILPSolver(\n'
+    '                edge_weight=cfg.ilp_edge_weight * td.EdgeAttr("edge_prob"),\n'
+    '                appearance_weight=cfg.ilp_appearance_weight,\n'
+    '                disappearance_weight=cfg.ilp_disappearance_weight,\n'
+    '                division_weight=cfg.ilp_division_weight,\n'
+    '            )\n'
+    '            with suppress_output():\n'
+    '                graph = solver.solve(graph)\n'
+)
+_ilp_new = (
+    '            import time as _ilp_time\n'
+    '            _ilp_timeout = float(os.environ.get("BIOHUB_ILP_TIMEOUT_S", "0") or 0.0)\n'
+    '            solver = td.solvers.ILPSolver(\n'
+    '                edge_weight=cfg.ilp_edge_weight * td.EdgeAttr("edge_prob"),\n'
+    '                appearance_weight=cfg.ilp_appearance_weight,\n'
+    '                disappearance_weight=cfg.ilp_disappearance_weight,\n'
+    '                division_weight=cfg.ilp_division_weight,\n'
+    '                timeout=_ilp_timeout if _ilp_timeout > 0 else None,\n'
+    '            )\n'
+    '            _ilp_t0 = _ilp_time.time()\n'
+    '            _ilp_nodes, _ilp_edges = graph.num_nodes(), graph.num_edges()\n'
+    '            with suppress_output():\n'
+    '                graph = solver.solve(graph)\n'
+    '            print(\n'
+    '                f"[{name}] ILP {_ilp_time.time() - _ilp_t0:.1f}s"\n'
+    '                f" | candidate nodes={_ilp_nodes} edges={_ilp_edges}"\n'
+    '                f" | timeout={_ilp_timeout if _ilp_timeout > 0 else None}",\n'
+    '                flush=True,\n'
+    '            )\n'
+)
+_ilp_count = _s.count(_ilp_old)
+if _ilp_count != 1:
+    raise RuntimeError(f"ILP timeout patch expected one solver block, found {_ilp_count}")
+_s = _s.replace(_ilp_old, _ilp_new, 1)
+print("ILP timeout patch applied |", os.environ.get("BIOHUB_ILP_TIMEOUT_S", "0"), "s per dataset")
+
+# ---- 补丁 7：逐影像打印“检测 + 关联”的耗时（仅诊断；锚点不唯一时只警告、不报错）----
+_pv_old = '        coords, edges = predict_video(\n'
+_bg_old = '        graph = build_graph(coords, edges)\n'
+if _s.count(_pv_old) == 1 and _s.count(_bg_old) == 1:
+    _s = _s.replace(
+        _pv_old,
+        '        import time as _pv_time\n        _pv_t0 = _pv_time.time()\n' + _pv_old,
+        1,
+    )
+    _s = _s.replace(
+        _bg_old,
+        _bg_old
+        + '        print(f"[{name}] detection+edges {_pv_time.time() - _pv_t0:.1f}s'
+        + ' | detections={len(coords)}", flush=True)\n',
+        1,
+    )
+    print("Per-dataset detection timing patch applied")
+else:
+    print(
+        "WARNING: detection timing anchors not unique "
+        f"({_s.count(_pv_old)}, {_s.count(_bg_old)}); timing prints skipped"
+    )
+# 补丁 4～7 都改在同一个字符串 _s 上，这里统一 compile 检查语法后一次写回。
+compile(_s, str(_ps), "exec")
+_ps.write_text(_s)
+print(
+    "Bidirectional harmonic-probability association fusion applied | weight=",
+    _bidirectional_weight_guard,
+)
+print("Pre-ILP detector-coordinate manifest hook applied")
+
+
+# ---- 补丁 8：主模型的特征 TTA 与关联特征修正 ----
+# 关联网络读取的是细胞位置上的 32 维 U-Net 特征。补丁 1 只平均了检测 logit；这里把 8 个视角的特征图也逆变换回原坐标
+#   求平均（unet_out ← 8 视角均值），关联打分对朝向更不敏感、更稳定。若平均后与单次前向完全相同就报错
+#   （说明增强视角根本没有生效，以免误判“特征 TTA 没有用”）。
+# 坐标修正（补丁 11）读取的也是这份平均后的 unet_out；训练 10 折坐标头时抓取的必须是同一种特征。
+# 关联特征修正：第 8 个视角其实是 x 翻转的重复。这里再编码一次真正的“反对角转置”图像
+#   imgs.transpose(-1, -2).flip((-2, -1))（它的逆变换是 .flip((-2, -1)).transpose(-1, -2)），逆变换后替换掉重复的那份：
+#   修正后的特征 _d4_unet_out = 8 视角均值 + (反对角转置视角 − 重复视角) / 8，就是正方形全部 8 种对称（二面体群）的精确平均。
+# _d4_unet_out 只用于补丁 13 的第二份关联概率 d4_prob（只供后处理的候选概率重链接）；检测、坐标修正和 ILP 仍用原来的
+#   unet_out，结果不变。代价是每个滑窗、每个模型多一次编码。
+# 本补丁的锚点 _et_old 就是补丁 1 写入的 8 视角代码块原文；最后设 BIOHUB_EDGE_FEATURE_TTA=1，让子进程启用它。
+_et_s = _ps.read_text()
+_et_old = '        if cfg.det_tta:\n            _nv = 1\n            for dims in [(-1,), (-2,), (-2, -1)]:\n                imgs_flip = imgs.flip(dims)\n                _, det_flip = model.encode(imgs_flip)\n                for f in range(W):\n                    det_logits[f] = det_logits[f] + det_flip[f].flip(dims)\n                del imgs_flip, det_flip\n                _nv += 1\n            for _k in (1, 3):\n                imgs_rot = torch.rot90(imgs, _k, dims=(-2, -1))\n                _, det_rot = model.encode(imgs_rot)\n                for f in range(W):\n                    det_logits[f] = det_logits[f] + torch.rot90(det_rot[f], -_k, dims=(-2, -1))\n                del imgs_rot, det_rot\n                _nv += 1\n            imgs_t = imgs.transpose(-1, -2)\n            _, det_t = model.encode(imgs_t)\n            for f in range(W):\n                det_logits[f] = det_logits[f] + det_t[f].transpose(-1, -2)\n            del imgs_t, det_t\n            _nv += 1\n            imgs_at = torch.rot90(imgs, 1, dims=(-2, -1)).transpose(-1, -2)\n            _, det_at = model.encode(imgs_at)\n            for f in range(W):\n                det_logits[f] = det_logits[f] + torch.rot90(det_at[f].transpose(-1, -2), -1, dims=(-2, -1))\n            del imgs_at, det_at\n            _nv += 1\n            for f in range(W):\n                det_logits[f] = det_logits[f] / _nv\n'
+_et_new = "        if cfg.det_tta:\n            _edge_tta = os.environ.get('BIOHUB_EDGE_FEATURE_TTA', '0') != '0'\n            _unet_acc = unet_out.clone() if _edge_tta else None\n            _nv = 1\n            for dims in [(-1,), (-2,), (-2, -1)]:\n                imgs_flip = imgs.flip(dims)\n                _u_flip, det_flip = model.encode(imgs_flip)\n                for f in range(W):\n                    det_logits[f] = det_logits[f] + det_flip[f].flip(dims)\n                if _edge_tta:\n                    _unet_acc = _unet_acc + _u_flip.flip(dims)\n                del imgs_flip, det_flip, _u_flip\n                _nv += 1\n            for _k in (1, 3):\n                imgs_rot = torch.rot90(imgs, _k, dims=(-2, -1))\n                _u_rot, det_rot = model.encode(imgs_rot)\n                for f in range(W):\n                    det_logits[f] = det_logits[f] + torch.rot90(det_rot[f], -_k, dims=(-2, -1))\n                if _edge_tta:\n                    _unet_acc = _unet_acc + torch.rot90(_u_rot, -_k, dims=(-2, -1))\n                del imgs_rot, det_rot, _u_rot\n                _nv += 1\n            imgs_t = imgs.transpose(-1, -2)\n            _u_t, det_t = model.encode(imgs_t)\n            for f in range(W):\n                det_logits[f] = det_logits[f] + det_t[f].transpose(-1, -2)\n            if _edge_tta:\n                _unet_acc = _unet_acc + _u_t.transpose(-1, -2)\n            del imgs_t, det_t, _u_t\n            _nv += 1\n            imgs_at = torch.rot90(imgs, 1, dims=(-2, -1)).transpose(-1, -2)\n            _u_at, det_at = model.encode(imgs_at)\n            for f in range(W):\n                det_logits[f] = det_logits[f] + torch.rot90(det_at[f].transpose(-1, -2), -1, dims=(-2, -1))\n            if _edge_tta:\n                _unet_acc = _unet_acc + torch.rot90(_u_at.transpose(-1, -2), -1, dims=(-2, -1))\n            _d4_primary_duplicate = torch.rot90(\n                _u_at.transpose(-1, -2), -1, dims=(-2, -1)\n            )\n            del imgs_at, det_at, _u_at\n            _nv += 1\n            for f in range(W):\n                det_logits[f] = det_logits[f] / _nv\n            if _edge_tta:\n                if _unet_acc.shape != unet_out.shape:\n                    raise RuntimeError('EDGE-TTA SHAPE MISMATCH: %s vs %s'\n                                       % (tuple(_unet_acc.shape), tuple(unet_out.shape)))\n                _delta = float((_unet_acc / _nv - unet_out).abs().mean())\n                if _delta == 0.0:\n                    raise RuntimeError('EDGE-TTA NO-OP: averaged features bit-identical to the '\n                                       'single-pass features, so the augmented encodes '\n                                       'contributed nothing and this arm would read as a '\n                                       'false null')\n                unet_out = _unet_acc / _nv\n                _d4_primary_image = imgs.transpose(-1, -2).flip((-2, -1))\n                _d4_primary_feature, _d4_primary_det = model.encode(_d4_primary_image)\n                _d4_primary_anti = _d4_primary_feature.flip((-2, -1)).transpose(-1, -2)\n                if _d4_primary_anti.shape != unet_out.shape:\n                    raise RuntimeError('D4 primary feature shape mismatch')\n                _d4_unet_out = unet_out + (\n                    _d4_primary_anti - _d4_primary_duplicate\n                ) / _nv\n                del _d4_primary_image, _d4_primary_feature, _d4_primary_det\n                del _d4_primary_anti, _d4_primary_duplicate\n                print('EDGE_TTA_ACTIVE views=', _nv, 'mean_abs_feat_delta=', round(_delta, 6), flush=True)\n                del _unet_acc\n"
+if _et_s.count(_et_old) != 1:
+    raise RuntimeError('edge-TTA anchor block not unique: %d' % _et_s.count(_et_old))
+_et_s = _et_s.replace(_et_old, _et_new, 1)
+compile(_et_s, str(_ps), 'exec')
+_ps.write_text(_et_s)
+if 'EDGE_TTA_ACTIVE' not in _ps.read_text():
+    raise RuntimeError('EDGE-TTA PATCH DID NOT PERSIST')
+os.environ['BIOHUB_EDGE_FEATURE_TTA'] = '1'
+print('EDGE_TTA patch installed and enabled in', _ps)
+
+# ---- 补丁 9：副模型的特征 TTA 与关联特征修正 ----
+# 与补丁 8 相同，作用于副模型（只在副模型检测权重 > 0 且开启检测 TTA 时执行）。区别是副模型的特征只做部分平均：
+#   (1 − 0.75) × 单次前向 + 0.75 × 8 视角均值（BIOHUB_SECONDARY_EDGE_FEATURE_TTA_WEIGHT = 0.75，取值须在 (0, 1]），
+#   对应的关联特征修正项也乘 0.75。锚点是补丁 2 第 (2) 项写入的文本。
+_secondary_tta_source = _ps.read_text()
+_secondary_tta_old = '        secondary_unet_out, secondary_det_logits = secondary_model.encode(imgs)\n\n            if secondary_detection_weight > 0.0:\n                if cfg.det_tta:\n                    _secondary_nv = 1\n                    for dims in [(-1,), (-2,), (-2, -1)]:\n                        secondary_imgs_flip = imgs.flip(dims)\n                        _, secondary_det_flip = secondary_model.encode(secondary_imgs_flip)\n                        for f in range(W):\n                            secondary_det_logits[f] = (\n                                secondary_det_logits[f] + secondary_det_flip[f].flip(dims)\n                            )\n                        del secondary_imgs_flip, secondary_det_flip\n                        _secondary_nv += 1\n                    for _k in (1, 3):\n                        secondary_imgs_rot = torch.rot90(imgs, _k, dims=(-2, -1))\n                        _, secondary_det_rot = secondary_model.encode(secondary_imgs_rot)\n                        for f in range(W):\n                            secondary_det_logits[f] = secondary_det_logits[f] + torch.rot90(\n                                secondary_det_rot[f], -_k, dims=(-2, -1)\n                            )\n                        del secondary_imgs_rot, secondary_det_rot\n                        _secondary_nv += 1\n                    secondary_imgs_t = imgs.transpose(-1, -2)\n                    _, secondary_det_t = secondary_model.encode(secondary_imgs_t)\n                    for f in range(W):\n                        secondary_det_logits[f] = (\n                            secondary_det_logits[f] + secondary_det_t[f].transpose(-1, -2)\n                        )\n                    del secondary_imgs_t, secondary_det_t\n                    _secondary_nv += 1\n                    secondary_imgs_at = torch.rot90(\n                        imgs, 1, dims=(-2, -1)\n                    ).transpose(-1, -2)\n                    _, secondary_det_at = secondary_model.encode(secondary_imgs_at)\n                    for f in range(W):\n                        secondary_det_logits[f] = secondary_det_logits[f] + torch.rot90(\n                            secondary_det_at[f].transpose(-1, -2),\n                            -1,\n                            dims=(-2, -1),\n                        )\n                    del secondary_imgs_at, secondary_det_at\n                    _secondary_nv += 1\n                    for f in range(W):\n                        secondary_det_logits[f] = secondary_det_logits[f] / _secondary_nv\n\n                for f in range(W):'
+_secondary_tta_new = '        secondary_unet_out, secondary_det_logits = secondary_model.encode(imgs)\n            _secondary_edge_tta = os.environ.get(\n                "BIOHUB_SECONDARY_EDGE_FEATURE_TTA", "0"\n            ) != "0"\n            _secondary_unet_acc = (\n                secondary_unet_out.clone() if _secondary_edge_tta else None\n            )\n\n            if secondary_detection_weight > 0.0:\n                if cfg.det_tta:\n                    _secondary_nv = 1\n                    for dims in [(-1,), (-2,), (-2, -1)]:\n                        secondary_imgs_flip = imgs.flip(dims)\n                        _secondary_u_flip, secondary_det_flip = secondary_model.encode(\n                            secondary_imgs_flip\n                        )\n                        for f in range(W):\n                            secondary_det_logits[f] = (\n                                secondary_det_logits[f] + secondary_det_flip[f].flip(dims)\n                            )\n                        if _secondary_edge_tta:\n                            _secondary_unet_acc = _secondary_unet_acc + _secondary_u_flip.flip(dims)\n                        del secondary_imgs_flip, secondary_det_flip, _secondary_u_flip\n                        _secondary_nv += 1\n                    for _k in (1, 3):\n                        secondary_imgs_rot = torch.rot90(imgs, _k, dims=(-2, -1))\n                        _secondary_u_rot, secondary_det_rot = secondary_model.encode(\n                            secondary_imgs_rot\n                        )\n                        for f in range(W):\n                            secondary_det_logits[f] = secondary_det_logits[f] + torch.rot90(\n                                secondary_det_rot[f], -_k, dims=(-2, -1)\n                            )\n                        if _secondary_edge_tta:\n                            _secondary_unet_acc = _secondary_unet_acc + torch.rot90(\n                                _secondary_u_rot, -_k, dims=(-2, -1)\n                            )\n                        del secondary_imgs_rot, secondary_det_rot, _secondary_u_rot\n                        _secondary_nv += 1\n                    secondary_imgs_t = imgs.transpose(-1, -2)\n                    _secondary_u_t, secondary_det_t = secondary_model.encode(secondary_imgs_t)\n                    for f in range(W):\n                        secondary_det_logits[f] = (\n                            secondary_det_logits[f] + secondary_det_t[f].transpose(-1, -2)\n                        )\n                    if _secondary_edge_tta:\n                        _secondary_unet_acc = _secondary_unet_acc + _secondary_u_t.transpose(-1, -2)\n                    del secondary_imgs_t, secondary_det_t, _secondary_u_t\n                    _secondary_nv += 1\n                    secondary_imgs_at = torch.rot90(\n                        imgs, 1, dims=(-2, -1)\n                    ).transpose(-1, -2)\n                    _secondary_u_at, secondary_det_at = secondary_model.encode(\n                        secondary_imgs_at\n                    )\n                    for f in range(W):\n                        secondary_det_logits[f] = secondary_det_logits[f] + torch.rot90(\n                            secondary_det_at[f].transpose(-1, -2),\n                            -1,\n                            dims=(-2, -1),\n                        )\n                    if _secondary_edge_tta:\n                        _secondary_unet_acc = _secondary_unet_acc + torch.rot90(\n                            _secondary_u_at.transpose(-1, -2), -1, dims=(-2, -1)\n                        )\n                    _d4_secondary_duplicate = torch.rot90(\n                        _secondary_u_at.transpose(-1, -2), -1, dims=(-2, -1)\n                    )\n                    del secondary_imgs_at, secondary_det_at, _secondary_u_at\n                    _secondary_nv += 1\n                    for f in range(W):\n                        secondary_det_logits[f] = secondary_det_logits[f] / _secondary_nv\n                    if _secondary_edge_tta:\n                        if _secondary_unet_acc.shape != secondary_unet_out.shape:\n                            raise RuntimeError("SECONDARY_EDGE_TTA_SHAPE_MISMATCH")\n                        _secondary_delta = float(\n                            (_secondary_unet_acc / _secondary_nv - secondary_unet_out).abs().mean()\n                        )\n                        if _secondary_delta == 0.0:\n                            raise RuntimeError("SECONDARY_EDGE_TTA_NO_OP")\n                        _secondary_edge_tta_weight = float(os.environ.get(\n                            "BIOHUB_SECONDARY_EDGE_FEATURE_TTA_WEIGHT", "1.0"\n                        ))\n                        if not 0.0 < _secondary_edge_tta_weight <= 1.0:\n                            raise RuntimeError("SECONDARY_EDGE_TTA_BAD_WEIGHT")\n                        _secondary_tta_mean = _secondary_unet_acc / _secondary_nv\n                        secondary_unet_out = (\n                            (1.0 - _secondary_edge_tta_weight) * secondary_unet_out\n                            + _secondary_edge_tta_weight * _secondary_tta_mean\n                        )\n                        _d4_secondary_image = imgs.transpose(-1, -2).flip((-2, -1))\n                        _d4_secondary_feature, _d4_secondary_det = (\n                            secondary_model.encode(_d4_secondary_image)\n                        )\n                        _d4_secondary_anti = (\n                            _d4_secondary_feature.flip((-2, -1)).transpose(-1, -2)\n                        )\n                        if _d4_secondary_anti.shape != secondary_unet_out.shape:\n                            raise RuntimeError(\'D4 secondary feature shape mismatch\')\n                        _d4_secondary_unet_out = secondary_unet_out + (\n                            _secondary_edge_tta_weight\n                            * (_d4_secondary_anti - _d4_secondary_duplicate)\n                            / _secondary_nv\n                        )\n                        del _d4_secondary_image, _d4_secondary_feature\n                        del _d4_secondary_det, _d4_secondary_anti\n                        del _d4_secondary_duplicate\n                        print(\n                            "SECONDARY_EDGE_TTA_ACTIVE views=",\n                            _secondary_nv,\n                            "weight=",\n                            _secondary_edge_tta_weight,\n                            "mean_abs_feat_delta=",\n                            round(_secondary_delta, 6),\n                            flush=True,\n                        )\n                        del _secondary_unet_acc\n\n                for f in range(W):'
+_secondary_tta_count = _secondary_tta_source.count(_secondary_tta_old)
+if _secondary_tta_count != 1:
+    raise RuntimeError(
+        "secondary edge-TTA anchor expected one match, found "
+        + str(_secondary_tta_count)
+    )
+_secondary_tta_source = _secondary_tta_source.replace(
+    _secondary_tta_old, _secondary_tta_new, 1
+)
+compile(_secondary_tta_source, str(_ps), "exec")
+_ps.write_text(_secondary_tta_source)
+if "SECONDARY_EDGE_TTA_ACTIVE" not in _ps.read_text():
+    raise RuntimeError("secondary edge-TTA patch did not persist")
+os.environ["BIOHUB_SECONDARY_EDGE_FEATURE_TTA"] = "1"
+os.environ["BIOHUB_SECONDARY_EDGE_FEATURE_TTA_WEIGHT"] = "0.75"
+print("secondary edge-feature TTA patch installed and enabled", flush=True)
+
+
+# ---- 列出测试影像，写出“划分文件” ----
+# 推理脚本按 splits json 里第 split 个划分的 "test" 列表处理影像。最终评测时 Kaggle 会把测试目录换成隐藏测试集
+#   （影像的数量和名字都不同），所以列表必须在运行时从 TEST_DIR 读取，不能写死。
+# 只取以 .zarr 结尾的目录（训练目录里的 .geff 标注文件会被过滤掉）。第一、二部分在训练影像上生成训练数据时，
+#   就是把 TEST_DIR 指向训练影像（子集）后复用本段。
+def list_test_stems() -> list[str]:
+    if not TEST_DIR.exists():
+        raise FileNotFoundError(f"Test directory does not exist: {TEST_DIR}")
+    stems = sorted(path.name[:-5] for path in TEST_DIR.iterdir() if path.name.endswith(".zarr"))
+    if not stems:
+        raise FileNotFoundError(f"No test .zarr files found in {TEST_DIR}")
+    return stems
+
+
+test_stems = list_test_stems()
+print(f"Found {len(test_stems)} test videos")
+print(test_stems[:10])
+
+splits_path = REPO_DIR / "kaggle_test_splits_50ep.json"
+splits_path.parent.mkdir(parents=True, exist_ok=True)
+splits_path.write_text(json.dumps([{"split": 0, "train": [], "test": test_stems}], indent=2))
+
+# 子进程命令行。检测阈值 0.965：热图中的局部极大、且 sigmoid 概率高于它的体素才算一个细胞。支持包命令行帮助的解释是：
+#   GT 只标注了部分细胞，检测器的概率校准不好，要用高阈值保证精度。另外，指标的节点数调整项让每多报一个节点都略微扣分。
+#   低于阈值的峰另行保存（补丁 10），交给后处理按轨迹上下文“找回”和“补缺”。
+# ILP 权重：边 −1.0（选中一条边得到收益 p）、出现 0.0、消失 2.0、分裂 0.4。按 tracksdata 对这些成本的通常含义推算
+#   （见补丁 6）：出现成本为 0 时，第二个子细胞总可以免费开一条新轨迹，所以只有第二条子边的 p 超过分裂成本时 ILP 才会
+#   选择分裂（分裂成本 ≥ 1 就永远不出分裂）。0.4 取自讨论区公开帖。
+#   ILP 选出的边之后会被后处理的重链接替换，所以 0.4 的实际作用主要是让 ILP 多保留少量节点；
+#   真正的分裂识别交给后处理的安全分裂与分裂补全打分器。
+predict_cmd = [
+    sys.executable,
+    "scripts/predict_unet_transformer.py",
+    "--data-dir",
+    str(TEST_DIR),
+    "--splits",
+    str(splits_path.name),
+    "--split",
+    "0",
+    "--weights",
+    WEIGHTS_RELATIVE,
+    "--unet-batch-size",
+    str(UNET_BATCH_SIZE),
+    "--det-threshold",
+    str(DET_THRESHOLD),
+    "--ilp-edge-weight",
+    str(ILP_EDGE_WEIGHT),
+    "--ilp-appearance-weight",
+    str(ILP_APPEARANCE_WEIGHT),
+    "--ilp-disappearance-weight",
+    str(ILP_DISAPPEARANCE_WEIGHT),
+    "--ilp-division-weight",
+    str(ILP_DIVISION_WEIGHT),
+]
+if USE_ILP:
+    predict_cmd.append("--use-ilp")
+if SLICE:
+    predict_cmd.extend(["--slice", SLICE])
+
+# ---- 多 GPU 分片的辅助函数 ----
+# Kaggle 提供 2 块 T4：把影像列表按 0::2、1::2 切成两片，各起一个独立子进程、各占一块 GPU 并行推理，总耗时约减半；
+#   独立进程之间不争用显存。
+# _visible_cuda_tokens：取前 count 个可见 GPU 的编号；_prediction_dir_for_method：找到某个 --method 唯一的输出目录；
+# _wait_for_prediction_shards：每秒轮询，任一分片失败就终止其余分片并报错（快速失败，不浪费 GPU 时间）；
+# _merge_prediction_shards：校验每片的输出恰好等于分配给它的影像、各片之间没有重复、并集等于全部测试影像，
+#   先移到临时目录再校验一遍，最后整体改名为 predictions/<…>/unet_transformer/split_0。
+#   中间那一级目录名来自支持包的 dataspec.USERNAME（环境变量 $USER，没有时为 "unknown"），与 Kaggle 账号无关；
+#   下面的变量名 username_roots 指的就是这一级目录。
+def _visible_cuda_tokens(count: int) -> list[str]:
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if raw and raw != "-1":
+        tokens = [token.strip() for token in raw.split(",") if token.strip()]
+        if len(tokens) < count:
+            raise RuntimeError(
+                f"torch reports {count} CUDA devices but CUDA_VISIBLE_DEVICES={raw!r}"
+            )
+        return tokens[:count]
+    return [str(index) for index in range(count)]
+
+
+def _prediction_dir_for_method(method: str) -> Path:
+    matches = sorted((REPO_DIR / "predictions").glob(f"*/{method}/split_0"))
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Expected exactly one prediction directory for {method!r}, found {matches}"
+        )
+    return matches[0]
+
+
+def _wait_for_prediction_shards(
+    processes: dict[int, subprocess.Popen],
+    commands: dict[int, list[str]],
+) -> None:
+    while processes:
+        failed: tuple[int, int] | None = None
+        for shard_index, process in list(processes.items()):
+            return_code = process.poll()
+            if return_code is None:
+                continue
+            del processes[shard_index]
+            if return_code != 0:
+                failed = (shard_index, return_code)
+                break
+        if failed is None:
+            if processes:
+                time.sleep(1.0)
+            continue
+
+        failed_index, failed_code = failed
+        for process in processes.values():
+            if process.poll() is None:
+                process.terminate()
+        for process in processes.values():
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        raise subprocess.CalledProcessError(failed_code, commands[failed_index])
+
+
+def _merge_prediction_shards(worker_count: int) -> Path:
+    shard_dirs: list[Path] = []
+    seen: set[str] = set()
+    expected_all = set(test_stems)
+
+    for shard_index in range(worker_count):
+        shard_method = f"{METHOD}_gpu{shard_index}"
+        shard_dir = _prediction_dir_for_method(shard_method)
+        expected = set(test_stems[shard_index::worker_count])
+        shard_paths = sorted(shard_dir.glob("*.geff"))
+        found = {path.stem for path in shard_paths}
+        if found != expected:
+            raise RuntimeError(
+                f"GPU shard {shard_index} output mismatch: "
+                f"missing={sorted(expected - found)}, extra={sorted(found - expected)}"
+            )
+        overlap = seen & found
+        if overlap:
+            raise RuntimeError(f"Duplicate datasets across GPU shards: {sorted(overlap)}")
+        seen.update(found)
+        shard_dirs.append(shard_dir)
+
+    if seen != expected_all:
+        raise RuntimeError(
+            f"Merged GPU shards do not cover the test set: "
+            f"missing={sorted(expected_all - seen)}, extra={sorted(seen - expected_all)}"
+        )
+
+    username_roots = {shard_dir.parents[1] for shard_dir in shard_dirs}
+    if len(username_roots) != 1:
+        raise RuntimeError(f"GPU shards used inconsistent prediction roots: {username_roots}")
+    import shutil as _shutil
+
+    final_root = next(iter(username_roots)) / METHOD
+    final_dir = final_root / "split_0"
+    staging_dir = final_root / "split_0_dual_gpu_staging"
+    if staging_dir.exists():
+        if staging_dir.is_dir():
+            _shutil.rmtree(staging_dir)
+        else:
+            staging_dir.unlink()
+    staging_dir.mkdir(parents=True, exist_ok=False)
+
+    for shard_dir in shard_dirs:
+        for source in sorted(shard_dir.glob("*.geff")):
+            destination = staging_dir / source.name
+            if destination.exists():
+                raise RuntimeError(f"Refusing to overwrite duplicate merged output: {destination}")
+            _shutil.move(str(source), str(destination))
+
+    merged = {path.stem for path in staging_dir.glob("*.geff")}
+    if merged != expected_all:
+        raise RuntimeError(
+            f"Staged prediction directory failed verification: "
+            f"missing={sorted(expected_all - merged)}, extra={sorted(merged - expected_all)}"
+        )
+
+    if final_dir.exists():
+        if final_dir.is_dir():
+            _shutil.rmtree(final_dir)
+        else:
+            final_dir.unlink()
+    staging_dir.rename(final_dir)
+    for shard_dir in shard_dirs:
+        _shutil.rmtree(shard_dir.parent)
+    print(f"Merged {len(merged)} prediction graphs into {final_dir}")
+    return final_dir
+
+
+# ---- 补丁 10：保存低分峰（为后处理的“找回”和“低分峰补缺”准备材料）----
+# 原理：正式阈值 0.965 很高，有些真实细胞的峰值概率达不到它。全局降低阈值会引入大量假阳性；更好的做法是把 sigmoid > 0.3
+#   的峰连同分数都存下来，后处理只在轨迹断开的地方（开放的轨迹端点附近、缺帧的位置）才去这些低分峰里找
+#   （找回只收 ≥ 0.94 的峰，补缺只收 ≥ 0.5 的峰），有轨迹上下文担保，召回提高而假阳性很少。
+# 列表中的 6 处替换：(1)(4) 在 predict_video 定义之前（模块级）声明缓存变量与阈值；(2) 旧的“按概率阈值缓存边”
+#   （本管线阈值为 0，实际不收集）；
+#   (3)(6) 每段影像写出 <BIOHUB_CACHE_DIR>/<影像名>.npz：coords（修正后的检测坐标）、low_coords / low_score
+#   （低分峰，原分辨率体素坐标，未经坐标修正）、admitted（全部 p > 0.48 的候选边）；
+#   (5) 每帧检测时，用同一张融合热图、同样的 3×3×3 池化、阈值 0.3 再找一遍峰，并记下峰处的 sigmoid 分数。
+# 外层 try/except 把失败当作非致命（没有低分峰时，后处理的找回和补缺只是空转）；但补丁 12 以这里写入的
+#   "if _CACHE_THRESHOLD > 0:" 为锚点，所以本管线中 BIOHUB_CACHE_DIR 必须设置、本补丁必须成功，否则补丁 12 会直接报错。
+_cache_dir_env = os.environ.get("BIOHUB_CACHE_DIR", "").strip()
+if _cache_dir_env:
+    try:
+        _cs = _ps.read_text()
+        for _label, _old, _new in [('predict_video globals', '@torch.no_grad()\ndef predict_video(', "_CACHE_EDGES: list = []\n_CACHE_THRESHOLD = float(os.environ.get('BIOHUB_CACHE_EDGE_THRESHOLD', '0') or 0)\n_CACHE_DIR = os.environ.get('BIOHUB_CACHE_DIR', '').strip()\n\n\n@torch.no_grad()\ndef predict_video("), ('candidate dump', '            candidates = sorted(', '            if _CACHE_THRESHOLD > 0:\n                _ci, _cj = np.nonzero(probs > _CACHE_THRESHOLD)\n                if _ci.size:\n                    _CACHE_EDGES.append((\n                        np.asarray(idx_src)[_ci].astype(np.int32),\n                        np.asarray(idx_tgt)[_cj].astype(np.int32),\n                        probs[_ci, _cj].astype(np.float32),\n                    ))\n            candidates = sorted('), ('cache write', '        graph = build_graph(coords, edges)', "        if _CACHE_DIR:\n            import pathlib\n            _cd = pathlib.Path(_CACHE_DIR)\n            _cd.mkdir(parents=True, exist_ok=True)\n            if _CACHE_EDGES:\n                _es = np.concatenate([e[0] for e in _CACHE_EDGES])\n                _et = np.concatenate([e[1] for e in _CACHE_EDGES])\n                _ep = np.concatenate([e[2] for e in _CACHE_EDGES])\n            else:\n                _es = np.empty(0, np.int32); _et = np.empty(0, np.int32)\n                _ep = np.empty(0, np.float32)\n            np.savez_compressed(\n                _cd / f'{name}.npz', coords=coords,\n                edge_src=_es, edge_tgt=_et, edge_prob=_ep,\n                admitted=np.asarray(edges, dtype=np.float64),\n            )\n            print(f'CACHE {name}: {len(coords)} nodes, {_es.size} edges', flush=True)\n            _CACHE_EDGES.clear()\n        graph = build_graph(coords, edges)"), ('lowdet globals', "_CACHE_DIR = os.environ.get('BIOHUB_CACHE_DIR', '').strip()\n", "_CACHE_DIR = os.environ.get('BIOHUB_CACHE_DIR', '').strip()\n_LOWDET_THRESHOLD = float(os.environ.get('BIOHUB_LOWDET_THRESHOLD', '0') or 0)\n_LOWDET: list = []\n"), ('lowdet peaks', '                arr = _detect_cells_pooled(\n                    det_logits[f_idx][0], t, cfg.det_threshold, pool_k,\n                )\n                coord_offset[t] = (global_node_count, global_node_count + len(arr))\n', '                arr = _detect_cells_pooled(\n                    det_logits[f_idx][0], t, cfg.det_threshold, pool_k,\n                )\n                if _LOWDET_THRESHOLD > 0:\n                    _low = _detect_cells_pooled(det_logits[f_idx][0], t, _LOWDET_THRESHOLD, pool_k)\n                    if len(_low):\n                        _lg = det_logits[f_idx][0][0]\n                        _lz = torch.as_tensor(_low[:, 1:].astype(np.int64), device=_lg.device)\n                        _lsc = torch.sigmoid(_lg[_lz[:, 0], _lz[:, 1], _lz[:, 2]]).float().cpu().numpy()\n                        _LOWDET.append((_low.astype(np.float32), _lsc.astype(np.float32)))\n                coord_offset[t] = (global_node_count, global_node_count + len(arr))\n'), ('lowdet write', "            np.savez_compressed(\n                _cd / f'{name}.npz', coords=coords,\n", "            if _LOWDET:\n                _lc = np.concatenate([e[0] for e in _LOWDET]).astype(np.float32)\n                _lc[:, 1:] *= np.array(downsample, dtype=np.float32)\n                _lc = _lc.astype(np.int16)\n                _lsc = np.concatenate([e[1] for e in _LOWDET]).astype(np.float32)\n            else:\n                _lc = np.empty((0, 4), np.int16)\n                _lsc = np.empty(0, np.float32)\n            _LOWDET.clear()\n            print(f'LOWDET {name}: {len(_lc)} peaks above {_LOWDET_THRESHOLD}', flush=True)\n            np.savez_compressed(\n                _cd / f'{name}.npz', coords=coords, low_coords=_lc, low_score=_lsc,\n")]:
+            if _cs.count(_old) != 1:
+                raise RuntimeError(f"{_label}: anchor count={_cs.count(_old)}")
+            _cs = _cs.replace(_old, _new, 1)
+        compile(_cs, str(_ps), "exec")
+        _ps.write_text(_cs)
+        print("Low-detection dump applied | dir=", _cache_dir_env,
+              "| lowdet threshold=", os.environ.get("BIOHUB_LOWDET_THRESHOLD"))
+    except Exception as _dump_exc:
+        print("LOW-DETECTION DUMP SKIPPED (non-fatal):", type(_dump_exc).__name__, _dump_exc)
+else:
+    print("Low-detection dump disabled (BIOHUB_CACHE_DIR unset)")
+
+
+# ---- 补丁 11：坐标修正（10 折坐标头）----
+# 顺序很重要：本补丁要在 "coord_offset[t] = (global_node_count, ...)" 这一行之前插入一行，而补丁 10 的低分峰替换也以
+#   同一行为锚点（它的锚点是 "arr = _detect_cells_pooled(...)" 后面紧跟这一行）。必须先打补丁 10（它的替换文本会原样
+#   保留这一行），再打本补丁，两者才都能找到唯一的锚点。
+#   顺序反了，补丁 10 的锚点计数变成 0，被它的 try/except 当作非致命错误吞掉，整个补丁 10 都不会写回：低分峰不写出，
+#   后处理的找回和补缺全程空转。在还没有补丁 12 的公开基线里，程序对此完全不报错，日志里只有一行
+#   "LOW-DETECTION DUMP SKIPPED"，这种静默失效最难发现；本管线中，补丁 12 会因找不到补丁 10 写入的锚点而直接报错。
+#   所以补丁顺序本身就是正确性的一部分。
+# 写出坐标修正模块 v1284_coordinate_refinement.py（与推理脚本同目录，子进程可以直接 import）。
+#   下面字符串的内容与第一部分的 part1_cv10_coord_head/coord_head_module.py 逐字相同，详细原理见模块里的中文注释。要点：
+#   · 输入特征 224 维 = 7 个位置（检测峰体素 + ±z / ±y / ±x 六个邻点）× 32 通道，邻点用“邻点 − 中心”的差分形式；
+#   · 网络 224 → 32 → 3，最后一层零初始化（从“不修正”出发）；输出经有界映射 2δ/(1+‖δ‖)，位移恒小于 2 µm；
+#   · V1284_MODE：zero 不修正；capture 导出训练数据；candidate 对全部头的有界位移取平均，÷ 1.625 µm 换成网格单位后加到坐标上；
+#   · index_features：三线性插值取特征，替换关联网络原来的整数取址（整数坐标时结果完全相同）。
+# 原理：检测峰只能落在 1.625 µm 的网格上。比赛按 7 µm 半径匹配节点，微调坐标几乎不改变“能否配上”；
+#   收益来自关联（三线性特征、位置编码、坐标差）和后处理中各种距离门限更准。
+#   单组件效果：与公开坐标头相比，私榜 +0.0072；在几组配对提交里公榜反而下降 0.001～0.004
+#   （公、私榜方向相反，只看公榜会错过这个改进）。
+# 注意：模块文本含中文注释，write_text() 按系统默认编码写盘；Kaggle 默认是 UTF-8。若在别的环境里这里报
+#   UnicodeEncodeError，设置环境变量 PYTHONUTF8=1 后重跑即可（模块代码本身只有 ASCII）。
+(_ps.parent/'v1284_coordinate_refinement.py').write_text(r'''"""坐标修正模块（推理期）：在每个检测点首次被检出时，用冻结的 U-Net 特征回归亚体素位移。
+
+第三部分推理管线的第 4 段把本文件原样写成 scripts/v1284_coordinate_refinement.py，并给推理脚本
+（支持包的 scripts/predict_unet_transformer.py）打 4 处补丁（导入本模块、删掉坐标转 int16 的一行，以及下面两处）。
+与本模块直接相关的两处是：
+  1) 每帧检测出峰之后、写入节点表之前调用 refine()，修正这一帧全部检测点的坐标；
+  2) 把关联网络的 _index_features 换成本模块的 index_features（三线性插值取特征）。
+文件名与环境变量名中的 V1284 是“坐标修正头”框架的代号，为了与推理管线保持一致没有改名。
+
+为什么要修正坐标：
+  检测在降采样网格上进行（z 不变，y、x 每 4 个像素取 1 个），网格三个方向都是 1.625 µm，
+  检测峰只能落在格点上，存在量化误差。在训练影像上，检测与相配 GT 的平均距离约 1.6～1.9 µm（随检测器和
+  配对半径而变），其中 z 方向的误差最大：GT 和检测的 z 都只能取整数层，相邻两层就差 1.625 µm。
+  这里用一个很小的 MLP 读取检测器自己的特征（U-Net 冻结，不再训练），为每个检测点预测一个
+  亚体素位移（单位 µm）。修正后的浮点坐标进入之后的关联、ILP、后处理和输出。
+  比赛按 7 µm 半径匹配节点，坐标修正几乎不改变“能否配上”；收益来自关联打分（三线性取特征、
+  位置编码、坐标差）和后处理中各种距离门限变得更准。
+
+三种模式（环境变量 V1284_MODE，由推理管线第 4 段设置）：
+  zero      不修正，只把坐标转成 float32，用作“没有坐标头”的对照；
+  capture   不修正，把每帧的 (检测坐标, 224 维特征) 存盘：这就是生成坐标头训练数据的方式
+            （第一部分 step1 用它导出特征，step2 再与 GT 配对得到训练样本）；
+  其它值    推理管线用 candidate：加载 V1284_HEAD 中的全部头（10 折坐标头共 10 个），
+            对它们各自的有界位移取平均，再加到检测坐标上。
+"""
+import os
+from pathlib import Path
+import numpy as np
+import torch
+
+# 降采样网格的格距（µm，顺序 z, y, x）。原始体素 z = 1.625 µm、y/x = 0.40625 µm，y/x 每 4 个取 1 个后
+# 三个方向都是 1.625 µm（各向同性）。头输出的位移单位是 µm，除以 SPACING 才是网格单位；
+# 末尾的安全检查再乘回 SPACING，把网格位移换回 µm。
+SPACING = np.array([1.625, 1.625, 1.625], dtype=np.float32)
+# 7 个采样位置（网格单位，顺序 z, y, x）：中心，以及 -z、+z、-y、+y、-x、+x 六个轴向邻点（各相距 1 格 = 1.625 µm）。
+# 这个顺序决定 224 维特征的排列。训练特征就是用本模块的 capture 模式导出的，所以训练与推理天然一致。
+OFFSETS = ((0,0,0), (-1,0,0), (1,0,0), (0,-1,0), (0,1,0), (0,0,-1), (0,0,1))
+# 已加载的头：每个推理子进程第一次调用 refine 时从磁盘读入，之后每帧复用。
+_CACHE = None
+
+
+def make_head():
+    """坐标头网络：MLP 224 → 32 → 3（SiLU 激活），共 7,299 个参数。
+
+    输入是 sample_features 给出的 224 维特征（推理时先用该头训练折上的均值、尺度标准化），
+    输出 3 维向量 δ（z, y, x，单位 µm），再经 bounded() 变成真正的位移。
+    最后一层的权重和偏置都初始化为 0：未训练时无论输入是什么，输出都恒为 0，即“不修正”（恒等映射）。
+    训练从恒等出发，只学对损失有帮助的修正，不会一开始就随机挪动坐标；第一步只有最后一层收到梯度，
+    它一旦离开 0，前一层也开始学习。推理时 load_state_dict 会覆盖这些初值，零初始化只影响训练的起点。
+    """
+    head = torch.nn.Sequential(torch.nn.Linear(224, 32), torch.nn.SiLU(), torch.nn.Linear(32, 3))
+    torch.nn.init.zeros_(head[-1].weight)
+    torch.nn.init.zeros_(head[-1].bias)
+    return head
+
+
+def bounded(head, x):
+    """有界输出：把头的原始输出 δ 映射成 2δ/(1+‖δ‖)，其中 ‖δ‖ 是三维向量的模长，方向保持不变。
+
+    映射后的模长 2‖δ‖/(1+‖δ‖) 恒小于 2，所以每个头给出的修正位移都小于 2 µm：只做网格间距（1.625 µm）
+    量级的微调，即使输入异常也不会把检测点挪到很远的地方。‖δ‖ 很小时约等于 2δ（近似线性），‖δ‖ 很大时饱和。
+    训练时 Huber 损失直接作用在这个有界输出上，训练与推理用的是同一个映射。
+    """
+    delta = head(x)
+    return 2.0 * delta / (1.0 + torch.linalg.vector_norm(delta, dim=-1, keepdim=True))
+
+
+def sample_features(feature, arr):
+    """取每个检测点的 224 维输入特征 = 7 个位置 × 32 通道。
+
+    feature：主模型在这一帧的 32 通道 U-Net 特征图，形状 (1, 32, Z, Y, X)，网格就是检测用的 1.625 µm 网格。
+      它是开启特征 TTA 之后的 8 视角平均特征（其中 x 翻转视角重复计了一次，见推理管线第 4 段），
+      取自这一帧第一次出现的那个滑窗。训练坐标头时抓取的正是同一份特征，训练与推理的输入分布才一致。
+    arr：这一帧的检测，形状 (N, 4)，列为 [t, z, y, x]，是检测峰所在体素的整数网格坐标。
+    返回 (N, 224)：[中心特征, 邻点1 − 中心, …, 邻点6 − 中心]。
+    “邻点 − 中心”相当于特征沿 ±z、±y、±x 的有限差分（局部梯度），告诉网络真实中心偏向哪一侧；
+    中心特征本身提供这个细胞的外观与所处位置的上下文。
+    """
+    xyz = torch.as_tensor(arr[:, 1:], device=feature.device, dtype=torch.long)
+    blocks = []
+    for offset in OFFSETS:
+        loc = xyz + torch.tensor(offset, device=feature.device)
+        # 越界的邻点截断到图像边界上（此时该方向的差分为 0），保证索引合法。
+        for axis, size in enumerate(feature.shape[-3:]):
+            loc[:, axis].clamp_(0, size-1)
+        blocks.append(feature[0, :, loc[:,0], loc[:,1], loc[:,2]].T)
+    # 中心特征 + 6 个方向差分（邻点 − 中心），拼成 7 × 32 = 224 维。
+    return torch.cat([blocks[0]] + [b - blocks[0] for b in blocks[1:]], dim=1)
+
+
+def index_features(self, maps, coords, mask):
+    """三线性插值取特征，替换关联网络原来的 _index_features（推理管线把它挂到模型类上，主、副模型都生效）。
+
+    原实现把坐标截断成整数（.long()）后直接取该体素的特征；坐标修正后检测点带小数，截断会丢掉修正。
+    这里取包围该点的 8 个体素，按到各体素的距离做三线性加权，关联网络就能读到亚体素位置的特征。
+    坐标为整数时 frac = 0，只有 (0,0,0) 角的权重为 1、其余 7 个角权重为 0，结果与原来的整数取址完全相同：
+    所以不修正坐标时（zero / capture 模式），关联结果与原流程一致。
+    maps：(B, C, Z, Y, X) 特征图；coords：(B, N, 3) 网格坐标 (z, y, x)；mask：(B, N)，有效点排在前面。
+    """
+    out = torch.zeros((*coords.shape[:2], maps.shape[1]), device=maps.device, dtype=maps.dtype)
+    for batch in range(len(maps)):
+        n = int(mask[batch].sum())
+        if not n:
+            continue
+        q = coords[batch, :n].clone()
+        # 先把坐标截断到网格范围内，再取左下角体素 low 与小数部分 frac。
+        for axis, size in enumerate(maps.shape[-3:]):
+            q[:,axis].clamp_(0, size-1)
+        low = q.floor().long()
+        frac = q-low
+        # 遍历 8 个角：某一轴取 +1 的角，在该轴上的权重为 frac，否则为 1 − frac；三轴权重相乘。
+        for z in (0,1):
+            for y in (0,1):
+                for x in (0,1):
+                    shift = torch.tensor([z,y,x], device=maps.device)
+                    loc = low+shift
+                    for axis, size in enumerate(maps.shape[-3:]):
+                        loc[:,axis].clamp_(0,size-1)
+                    weight = torch.where(shift.bool(), frac, 1-frac).prod(dim=1)
+                    out[batch,:n] += maps[batch,:,loc[:,0],loc[:,1],loc[:,2]].T * weight[:,None]
+    return out
+
+
+def refine(ds_path, t, arr, feature):
+    """修正第 t 帧全部检测点的坐标；每帧检测完成后、写入节点表之前调用一次。
+
+    ds_path：当前影像的 .zarr 路径（capture 模式用它的文件名建子目录）；t：帧号；
+    arr：(N, 4) 整数网格坐标 [t, z, y, x]；feature：这一帧的 32 通道特征图（见 sample_features）。
+    返回 (N, 4) 坐标；candidate 模式下为 float32，z、y、x 带亚体素小数（仍是网格单位）。
+    推理脚本的 predict_video 带有 @torch.no_grad()，这里的前向不会记录梯度。
+    """
+    global _CACHE
+    # 模式由推理管线通过环境变量传给子进程；没有设置时直接 KeyError，避免“以为修正了，其实没有”。
+    mode = os.environ['V1284_MODE']
+    # 空帧（没有检测）原样返回。
+    if not len(arr):
+        return arr
+    # zero：不修正，只转成 float32（与修正后的数据类型一致），作“无坐标头”的对照。
+    if mode == 'zero':
+        return arr.astype(np.float32)
+    x = sample_features(feature, arr).float()
+    # capture：导出训练数据。把整数网格坐标 [t, z, y, x]（z、y、x 乘 1.625 才是 µm）和 224 维特征存成
+    # <V1284_CAPTURE>/<影像名>/<帧号:04d>.npz（键 coords、features）。坐标不变，所以下游结果等同于不加坐标头。
+    # 之后与 GT 配对，得到 (特征, GT − 检测 的位移) 训练样本。
+    if mode == 'capture':
+        folder = Path(os.environ['V1284_CAPTURE']) / ds_path.stem
+        folder.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(folder/f'{int(t):04d}.npz', coords=arr, features=x.cpu().numpy())
+        return arr
+    # 其它模式（推理管线用 candidate）：第一次调用时加载 V1284_HEAD 中的全部头（多个路径用 os.pathsep 连接，
+    # 10 折坐标头是 fold0.pt … fold9.pt）。每个 .pt 里有 state_dict，以及该头在自己的训练折上算出的
+    # 输入均值 mean 和标准差 scale（下限 1e-3，防止除以 0；标准化必须与训练时完全一致）。
+    if _CACHE is None:
+        _CACHE = []
+        for _path in os.environ['V1284_HEAD'].split(os.pathsep):
+            saved = torch.load(_path, map_location='cpu', weights_only=True)
+            head = make_head().to(feature.device)
+            head.load_state_dict(saved['state_dict']); head.eval()
+            _CACHE.append((head, saved['mean'].to(feature.device), saved['scale'].to(feature.device)))
+    # 10 折集成：每个头先用自己的 mean/scale 标准化输入，各自输出有界位移（µm），再对所有头取平均。
+    # 10 个头各自见过不同的约 90% 训练影像，误差不完全相关，取平均相当于小型集成，能降低方差。
+    # 每个有界位移的模长都小于 2 µm，它们的平均（凸组合）模长也小于 2 µm。只有 1 个头时就是单头的计算。
+    # 平均位移除以 SPACING（1.625 µm/格）换算成网格单位。
+    shift = torch.stack([bounded(head, (x-mean)/scale) for head, mean, scale in _CACHE]).mean(dim=0).cpu().numpy() / SPACING
+    result = arr.astype(np.float32).copy()
+    result[:,1:] += shift
+    # 修正后的点截断在网格范围内（不能落到图像外）；第 0 列帧号不变。
+    result[:,1:] = np.clip(result[:,1:], 0, np.asarray(feature.shape[-3:])-1)
+    # 安全检查：出现非有限值，或任何一个点的实际位移超过 2 µm（理论上限是 2 µm，多留 0.00001 µm 容纳 float32 舍入误差），
+    # 说明头文件或输入有问题，直接报错，而不是悄悄输出坏坐标。
+    if not np.isfinite(result).all() or np.max(np.linalg.norm((result[:,1:]-arr[:,1:])*SPACING,axis=1)) > 2.00001:
+        raise RuntimeError('invalid V1284 displacement')
+    return result
+''')
+# 挂载 10 折坐标头：在 /kaggle/input 下递归查找 biohub-cv10-coord-head/fold*.pt，必须恰好 10 个（fold0 … fold9）。
+#   rglob 遍历整个 /kaggle/input，比较慢，好处是不依赖数据集具体挂载在哪一级目录。
+#   这 10 个头由第一部分的训练代码产出：先在 199 段训练影像上用 capture 模式导出（公开检测器权重的）特征，
+#   也就是上面 unet_out 那一份，与 GT 配对；再按影像分成 10 折，第 k 个头用其余 9 折训练，只在第 k 折上早停，
+#   并从 5 个随机种子中挑最好的。部署时 10 个头取平均（见模块 refine）。
+#   学员需把自己训练出的 10 个 fold*.pt 直接放在数据集根目录（不要再套子文件夹），上传为 Kaggle 数据集，
+#   名字就叫 biohub-cv10-coord-head，并挂载到本 notebook。
+#   离线评估（每段影像只用没见过它的那个折头修正；残差先按影像扣除平均偏移，再求平均距离）：残差下降 18.3%；
+#   在同一批配对上，公开坐标头只下降 11.1%。
+#   在训练影像上抓取特征（capture 模式）时还没有头，需要跳过这一检查。
+_myhead = sorted(Path('/kaggle/input').rglob('biohub-cv10-coord-head/fold*.pt'))
+if len(_myhead) != 10:
+    raise RuntimeError(('10 折坐标头文件数量不对（需要恰好 10 个 fold*.pt）', [str(p) for p in _myhead]))
+# 通过环境变量把模式和头路径传给子进程里的模块：candidate = 用全部头的平均位移修正坐标；多个路径用 os.pathsep 连接。
+os.environ['V1284_MODE']='candidate'
+os.environ['V1284_HEAD']=os.pathsep.join(str(p) for p in _myhead)
+
+# 4 处源码补丁（锚点同样必须恰好出现 1 次）：
+#   (1) 在 "import tracksdata as td" 之后导入本模块的 refine 与 index_features；
+#   (2) 每帧检测出峰、写入节点表之前，立即调用 _v1284_refine 修正这一帧的检测坐标 arr。
+#       修正后的浮点坐标进入之后的全部环节（关联取特征、位置编码、坐标差、候选缓存的距离、ILP、后处理、输出）。
+#       传入的 unet_out[:, f_idx] 是这一帧第一次出现的滑窗中、主模型 8 视角平均后的特征（不是关联特征修正版本）；
+#       低分峰（补丁 10）在修正之前就已取出，所以不经过修正；
+#   (3) 删掉把坐标转回 int16 的那一行（换成一行英文注释），让小数坐标一直保留到图的输出；
+#   (4) 加载主模型后，把模型类的 _index_features 换成三线性版本（类级替换，主、副模型都生效）。
+_trial_source = _ps.read_text()
+if _trial_source.count('import tracksdata as td\n') != 1: raise RuntimeError("V1284 patch anchor mismatch")
+_trial_source = _trial_source.replace('import tracksdata as td\n', 'import tracksdata as td\nfrom v1284_coordinate_refinement import refine as _v1284_refine, index_features as _v1284_index\n')
+if _trial_source.count('                coord_offset[t] = (global_node_count, global_node_count + len(arr))') != 1: raise RuntimeError("V1284 patch anchor mismatch")
+_trial_source = _trial_source.replace('                coord_offset[t] = (global_node_count, global_node_count + len(arr))', '                arr = _v1284_refine(ds_path, t, arr, unet_out[:, f_idx])\n                coord_offset[t] = (global_node_count, global_node_count + len(arr))')
+if _trial_source.count('    coords = coords.astype(np.int16)\n') != 1: raise RuntimeError("V1284 patch anchor mismatch")
+_trial_source = _trial_source.replace('    coords = coords.astype(np.int16)\n', '    # Preserve refined geometry through association and graph output.\n')
+if _trial_source.count('    model, window_size, downsample = load_model(weights_path, device)') != 1: raise RuntimeError("V1284 patch anchor mismatch")
+_trial_source = _trial_source.replace('    model, window_size, downsample = load_model(weights_path, device)', '    model, window_size, downsample = load_model(weights_path, device)\n    UNetNodeTransformer._index_features = _v1284_index')
+
+_ps.write_text(_trial_source)
+# 打印文字中的 readmit 指“找回”：补丁 10 保存的低分峰主要就是为找回和补缺准备的。
+print('V1284 head patched AFTER the readmit dump patch; mode =', os.environ['V1284_MODE'])
+
+# ---- 补丁 12：稠密候选概率缓存（供后处理的候选概率重链接使用）----
+# 原理：进入 ILP 的只有 p > 0.48 的边（每个细胞最多 2 个候选父亲）。后处理的 flow 重链接会结合运动先验重新匹配，
+#   如果它只知道 ILP 边的模型概率，其它“几何上合理、但没进 ILP”的配对就只能靠距离来判断。
+#   这里把每个帧对中“距离 ≤ 10 µm 的全部配对”与“每个目标细胞概率最高的 12 个源”的并集连同模型概率一起存下来，
+#   让重链接同时利用外观（模型概率）和运动几何；top-12 还覆盖了超出 10 µm 原始距离门限、但会被 flow 先验接纳的配对。
+# 只是多写缓存文件，不改变推理脚本原有的检测、关联与 ILP 结果（报错和打印文字里的 x138 指公开基线）。
+# _dr_replace：锚点必须恰好出现 1 次，否则报错。共 7 处替换，见下。
+_dr_source = _ps.read_text()
+def _dr_replace(old, new, label):
+    global _dr_source
+    count = _dr_source.count(old)
+    if count != 1:
+        raise RuntimeError(f"x138 candidate relink {label}: expected one anchor, found {count}")
+    _dr_source = _dr_source.replace(old, new, 1)
+
+# (1) 导入 cKDTree，用于半径近邻查询。
+_dr_replace(
+    "from pathlib import Path\n",
+    "from pathlib import Path\nfrom scipy.spatial import cKDTree\n",
+    "cKDTree import",
+)
+# (2) build_graph 增加一个输出参数，用来返回节点 id 的顺序（与 coords 的行顺序一致）。
+_dr_replace(
+    "    edges: list[tuple[int, int, float, float]],\n) -> td.graph.InMemoryGraph:",
+    "    edges: list[tuple[int, int, float, float]],\n    _dr_node_ids_out: list[int] | None = None,\n) -> td.graph.InMemoryGraph:",
+    "node mapping signature",
+)
+# (3) 节点批量加入图之后，把节点 id 依次写进这个列表；之后才能把“检测数组下标”映射成图节点 id。
+_dr_replace(
+    "    ])\n\n    if edges:\n",
+    "    ])\n\n    if _dr_node_ids_out is not None:\n"
+    "        _dr_node_ids_out.extend(int(node_id) for node_id in node_ids)\n\n"
+    "    if edges:\n",
+    "node mapping output",
+)
+# (4) 为每段影像准备候选收集列表：原概率 prob 与关联特征修正的 d4_prob 各一份。
+_dr_replace(
+    "    all_edges: list[tuple[int, int, float, float]] = []\n",
+    "    all_edges: list[tuple[int, int, float, float]] = []\n"
+    "    _dr_src_parts, _dr_tgt_parts, _dr_prob_parts = [], [], []\n    _d4_prob_parts = []\n",
+    "candidate collector",
+)
+# (5) 每个帧对算出 probs（以及补丁 13 插入的 _d4_probs）之后收集候选：网格坐标乘 1.625 µm/格换成 µm，
+#     cKDTree 半径查询得到 10 µm 内的全部 (源, 目标)；argpartition 沿源维度取每个目标的 top-12；
+#     两组配对都编码成 i × n_tgt + j，用 np.unique 去重合并，再记录全局下标与两份概率。
+#     注意：替换文本第一行的英文注释 "# Keep ordinary 10-um neighbors ..." 是补丁 13 的锚点，不能改动。
+_dr_replace(
+    "            if _CACHE_THRESHOLD > 0:\n",
+    '''            # Keep ordinary 10-um neighbors plus top-K model candidates.
+            _dr_radius = float(os.environ.get("BIOHUB_DR_RAW_RADIUS_UM", "10.0"))
+            _dr_topk = min(n_src, int(os.environ.get("BIOHUB_DR_TOPK", "12")))
+            _dr_scale = ds_arr * np.asarray(ds.scale, dtype=np.float32)
+            _dr_src_um = c_src[:, 1:].astype(np.float32) * _dr_scale
+            _dr_tgt_um = c_tgt[:, 1:].astype(np.float32) * _dr_scale
+            _dr_neighbors = cKDTree(_dr_tgt_um).query_ball_point(
+                _dr_src_um, r=_dr_radius + 1e-4
+            )
+            _dr_counts = np.fromiter(
+                (len(group) for group in _dr_neighbors), dtype=np.int32, count=n_src
+            )
+            _dr_geo_n = int(_dr_counts.sum())
+            _dr_geo_i = np.repeat(np.arange(n_src, dtype=np.int32), _dr_counts)
+            _dr_geo_j = np.fromiter(
+                (j for group in _dr_neighbors for j in group),
+                dtype=np.int32, count=_dr_geo_n,
+            )
+            if _dr_topk:
+                _dr_top_i = np.argpartition(
+                    probs, kth=n_src - _dr_topk, axis=0
+                )[n_src - _dr_topk:]
+                _dr_top_j = np.broadcast_to(
+                    np.arange(n_tgt, dtype=np.int32), _dr_top_i.shape
+                )
+                _dr_top_i = _dr_top_i.ravel()
+                _dr_top_j = _dr_top_j.ravel()
+            else:
+                _dr_top_i = np.empty(0, dtype=np.int32)
+                _dr_top_j = np.empty(0, dtype=np.int32)
+            _dr_keys = np.unique(np.concatenate((
+                _dr_geo_i.astype(np.int64) * n_tgt + _dr_geo_j,
+                _dr_top_i.astype(np.int64) * n_tgt + _dr_top_j,
+            )))
+            if len(_dr_keys):
+                _dr_i = (_dr_keys // n_tgt).astype(np.int32)
+                _dr_j = (_dr_keys % n_tgt).astype(np.int32)
+                _dr_src_parts.append(idx_src[_dr_i].astype(np.int32))
+                _dr_tgt_parts.append(idx_tgt[_dr_j].astype(np.int32))
+                _dr_prob_parts.append(probs[_dr_i, _dr_j].astype(np.float32))
+                _d4_prob_parts.append(_d4_probs[_dr_i, _dr_j].astype(np.float32))
+
+            if _CACHE_THRESHOLD > 0:
+''',
+    "model probability capture",
+)
+# (6) predict_video 返回前，先按“检测数组下标”存成 <影像名>.indices.npz（此时还没有建图，也就没有节点 id）。
+_dr_replace(
+    "    return coords, all_edges\n",
+    '''    _dr_cache_dir = Path("/kaggle/working/x138_candidate_prob_cache")
+    _dr_cache_dir.mkdir(parents=True, exist_ok=True)
+    _dr_src = np.concatenate(_dr_src_parts) if _dr_src_parts else np.empty(0, dtype=np.int32)
+    _dr_tgt = np.concatenate(_dr_tgt_parts) if _dr_tgt_parts else np.empty(0, dtype=np.int32)
+    _dr_prob = np.concatenate(_dr_prob_parts) if _dr_prob_parts else np.empty(0, dtype=np.float32)
+    _d4_prob = np.concatenate(_d4_prob_parts) if _d4_prob_parts else np.empty(0, dtype=np.float32)
+    if not (len(_dr_src) == len(_dr_tgt) == len(_dr_prob) == len(_d4_prob)):
+        raise RuntimeError("candidate probability arrays have inconsistent lengths")
+    np.savez_compressed(
+        _dr_cache_dir / f"{ds_path.stem}.indices.npz",
+        src_idx=_dr_src, tgt_idx=_dr_tgt, prob=_dr_prob, d4_prob=_d4_prob,
+        num_nodes=np.asarray([len(coords)], dtype=np.int64),
+    )
+    return coords, all_edges
+''',
+    "candidate index cache",
+)
+# (7) predict() 建图后读回 indices.npz，校验节点数一致、下标不越界，把下标映射成图节点 id，写出 <影像名>.probabilities.npz：
+#     source_id / target_id / prob / d4_prob，以及全部检测节点的 id 与坐标（detector_node_ids / detector_coords）。
+#     后处理的“找回”据此把找回的峰对应回原来的检测候选，继承它的模型概率。
+#     缓存目录名 x138_candidate_prob_cache 中的 x138 指公开基线；第 5 段按同一路径读取，两处必须一致。
+_dr_replace(
+    "        graph = build_graph(coords, edges)\n",
+    '''        _dr_node_ids: list[int] = []
+        graph = build_graph(coords, edges, _dr_node_ids_out=_dr_node_ids)
+        _dr_cache_dir = Path("/kaggle/working/x138_candidate_prob_cache")
+        with np.load(_dr_cache_dir / f"{name}.indices.npz", allow_pickle=False) as _dr_npz:
+            _dr_src_idx = _dr_npz["src_idx"]
+            _dr_tgt_idx = _dr_npz["tgt_idx"]
+            _dr_prob = _dr_npz["prob"]
+            _d4_prob = _dr_npz["d4_prob"]
+            _dr_expected_nodes = int(_dr_npz["num_nodes"][0])
+        if len(_dr_node_ids) != len(coords) or _dr_expected_nodes != len(coords):
+            raise RuntimeError(f"{name}: candidate node mapping mismatch")
+        if len(_dr_src_idx) and (
+            int(_dr_src_idx.max()) >= len(coords) or int(_dr_tgt_idx.max()) >= len(coords)
+        ):
+            raise RuntimeError(f"{name}: candidate index out of bounds")
+        _dr_node_ids_arr = np.asarray(_dr_node_ids, dtype=np.int64)
+        np.savez_compressed(
+            _dr_cache_dir / f"{name}.probabilities.npz",
+            source_id=_dr_node_ids_arr[_dr_src_idx],
+            target_id=_dr_node_ids_arr[_dr_tgt_idx],
+            prob=_dr_prob, d4_prob=_d4_prob,
+            num_nodes=np.asarray([len(coords)], dtype=np.int64),
+            detector_node_ids=_dr_node_ids_arr,
+            detector_coords=np.asarray(coords, dtype=np.float32),
+        )
+        (_dr_cache_dir / f"{name}.indices.npz").unlink()
+''',
+    "map candidate indices to graph IDs",
+)
+
+# ---- 补丁 13：关联特征修正的第二份关联概率 d4_prob ----
+# 把“取特征 → Transformer 打分 → 双向调和 → 副模型融合 → softmax”这一整段源码（从 _d4_begin 到 _d4_end）原样复制一份，
+#   用正则把变量换成关联特征修正版本：unet_out[:, → _d4_unet_out[:,，secondary_unet_out → _d4_secondary_unet_out，
+#   probs → _d4_probs；插回原代码之后、候选收集之前。正则里的单词边界保证 primary_probs、secondary_probs 等不会被误改。
+# 两份概率走完全相同的计算流程，只是特征不同。原来的 probs 仍用于候选边阈值和 ILP，所以检测、坐标修正、ILP 的结果
+#   都不变；_d4_probs 只进入稠密候选缓存（d4_prob），供后处理的候选概率重链接使用。
+# 追加的检查：形状一致、数值有限、与原概率之差不超过 1（两者都是 [0, 1] 内的概率）。
+import re as _d4_re
+_d4_begin = "            unet_feat_src = model._index_features(\n"
+_d4_end = "            # Keep ordinary 10-um neighbors plus top-K model candidates.\n"
+if _dr_source.count(_d4_begin) != 1 or _dr_source.count(_d4_end) != 1:
+    raise RuntimeError("D4 association scoring anchors are not unique")
+_d4_i = _dr_source.index(_d4_begin)
+_d4_j = _dr_source.index(_d4_end, _d4_i)
+_d4_score_block = _dr_source[_d4_i:_d4_j]
+for _d4_name in ("unet_out[:,", "secondary_unet_out", "probs ="):
+    if _d4_name not in _d4_score_block:
+        raise RuntimeError(f"D4 association scoring missing {_d4_name}")
+_d4_score_block = _d4_re.sub(
+    r"\bsecondary_unet_out\b", "_d4_secondary_unet_out", _d4_score_block
+)
+_d4_score_block = _d4_re.sub(
+    r"\bunet_out\b(?=\[:,)", "_d4_unet_out", _d4_score_block
+)
+_d4_score_block = _d4_re.sub(r"\bprobs\b", "_d4_probs", _d4_score_block)
+_d4_score_block += (
+    "            if _d4_probs.shape != probs.shape or not np.isfinite(_d4_probs).all():\n"
+    "                raise RuntimeError('D4 association probability shape/finite mismatch')\n"
+    "            if np.max(np.abs(_d4_probs - probs)) > 1.000001:\n"
+    "                raise RuntimeError('D4 association probability out of range')\n\n"
+)
+_dr_source = _dr_source[:_d4_j] + _d4_score_block + _dr_source[_d4_j:]
+# 每个滑窗结束时，一并释放两份关联特征修正特征图的显存。
+_d4_cleanup = "        del unet_out\n"
+if _dr_source.count(_d4_cleanup) != 1:
+    raise RuntimeError("D4 feature cleanup anchor not unique")
+_dr_source = _dr_source.replace(
+    _d4_cleanup,
+    "        del _d4_unet_out\n"
+    "        if secondary_model is not None and secondary_detection_weight > 0.0:\n"
+    "            del _d4_secondary_unet_out\n"
+    + _d4_cleanup,
+    1,
+)
+# 关联特征修正的特征只在检测 TTA、特征 TTA 都打开，且副模型存在、检测权重 > 0 时才会生成（否则 _d4_unet_out /
+#   _d4_secondary_unet_out 根本不存在）。所以在 predict_video 开头检查检测 TTA、副模型及其检测权重，配置不对立即报错，
+#   而不是跑到一半才 NameError；特征 TTA 由本段前面设置的环境变量保证打开。
+_d4_cfg_anchor = "    ds = open_dataset(ds_path, normalize=False, load_image=False, downsample=downsample)\n"
+if _dr_source.count(_d4_cfg_anchor) != 1:
+    raise RuntimeError("D4 TTA configuration anchor not unique")
+_dr_source = _dr_source.replace(
+    _d4_cfg_anchor,
+    "    if not cfg.det_tta:\n"
+    "        raise RuntimeError('Association-only D4 requires the original detection TTA')\n"
+    "    if secondary_model is None or secondary_detection_weight <= 0:\n"
+    "        raise RuntimeError('Association-only D4 requires the original secondary model')\n"
+    + _d4_cfg_anchor,
+    1,
+)
+
+# 补丁 12、13 都改在 _dr_source 上，统一 compile 检查语法后写回。
+compile(_dr_source, str(_ps), "exec")
+_ps.write_text(_dr_source)
+# 稠密候选缓存的参数：半径 10 µm、每个目标 top-12。同时把旧的“按概率阈值缓存边”关掉（阈值 0）：它与稠密候选缓存功能重复。
+os.environ["BIOHUB_DR_RAW_RADIUS_UM"] = "10.0"
+os.environ["BIOHUB_DR_TOPK"] = "12"
+os.environ["BIOHUB_CACHE_EDGE_THRESHOLD"] = "0"
+print("x138 candidate probability capture installed; x138 inference settings preserved")
+
+# ---- 启动推理子进程 ----
+# 有 ≥ 2 块 GPU 时按影像分两片并行：每片的命令加 --method unet_transformer_gpu{k} --slice k::2，并设置各自的
+#   CUDA_VISIBLE_DEVICES 与 BIOHUB_GPU_SHARD；全部完成后合并成一个输出目录。否则单进程运行。
+# 子进程以 REPO_DIR 为工作目录、PYTHONPATH=src，并继承本进程此前设置的全部环境变量（补丁代码在子进程里读取它们）。
+# 产出（供第 5 段起的后处理使用）：
+#   predictions/<…>/unet_transformer/split_0/<影像名>.geff                  ILP 之后的原始轨迹图；
+#   /kaggle/working/edge_cache/<影像名>.npz                                  低分峰与 ILP 候选边（补丁 10）；
+#   /kaggle/working/x138_candidate_prob_cache/<影像名>.probabilities.npz     稠密候选概率（补丁 12、13）。
+start_time = time.time()
+available_gpu_count = _torch.cuda.device_count()
+worker_count = min(2, available_gpu_count, len(test_stems))
+
+if worker_count >= 2 and not SLICE:
+    cuda_tokens = _visible_cuda_tokens(worker_count)
+    processes: dict[int, subprocess.Popen] = {}
+    commands: dict[int, list[str]] = {}
+    print(f"Launching {worker_count} independent video shards on CUDA devices {cuda_tokens}")
+    for shard_index in range(worker_count):
+        shard_method = f"{METHOD}_gpu{shard_index}"
+        shard_cmd = [
+            *predict_cmd,
+            "--method",
+            shard_method,
+            "--slice",
+            f"{shard_index}::{worker_count}",
+        ]
+        shard_env = {**os.environ, "PYTHONPATH": "src"}
+        shard_env["CUDA_VISIBLE_DEVICES"] = cuda_tokens[shard_index]
+        shard_env["BIOHUB_GPU_SHARD"] = f"{shard_index}/{worker_count}"
+        print(
+            f"GPU shard {shard_index}: CUDA_VISIBLE_DEVICES={cuda_tokens[shard_index]} | "
+            + " ".join(shard_cmd),
+            flush=True,
+        )
+        commands[shard_index] = shard_cmd
+        processes[shard_index] = subprocess.Popen(
+            shard_cmd,
+            cwd=REPO_DIR,
+            env=shard_env,
+        )
+    _wait_for_prediction_shards(processes, commands)
+    _merge_prediction_shards(worker_count)
+else:
+    reason = "SLICE is active" if SLICE else f"only {available_gpu_count} CUDA device(s) available"
+    print(f"Using single-process prediction because {reason}.")
+    print(" ".join(predict_cmd))
+    subprocess.run(
+        predict_cmd,
+        cwd=REPO_DIR,
+        env={**os.environ, "PYTHONPATH": "src"},
+        check=True,
+    )
+
+# 预测总耗时，第 5 段把它写进运行统计（run_stats.csv）。
+predict_seconds = time.time() - start_time
+print(f"Prediction completed in {predict_seconds / 60:.2f} minutes")
+
+# ===== 第 5 段：后处理——把每段影像的 ILP 结果图修整成最终轨迹，并写出提交文件 =====
+# 输入：第 4 段推理子进程为每段影像写出的 ILP 结果图（.geff：节点带 t/z/y/x，边带关联概率 edge_prob），
+#   以及两份缓存：低分峰（每帧热图上分数高于 0.3 的全部局部极大）与稠密候选概率（相距 10 µm 以内的全部候选对，
+#   加上每个 t+1 细胞概率最高的 12 个候选，各自的模型概率）。
+# 输出：本段末尾的 write_test_submission 对每段影像调用 filter_output_graph，把结果写成提交 CSV（第一遍后处理）。
+# 后处理的主体沿用公开基线。本方案新增的 6 个模块（全局位移估计、跳变感知平滑、候选概率重链接、关联特征修正、
+#   找回概率打分、分裂补全打分器）由 5 个模块级开关控制（全局位移估计与跳变感知平滑共用一个），定义处都是 False，
+#   只在第 11 段打开：最终一遍全部打开；可见测试集上另有一遍诊断，只关分裂补全打分器。
+#   本段末尾的第一遍不开这些模块，第 11 段把它的结果另存作参照。
+# 本段前半部分（到 readmit_discarded_detections 为止）是工具函数，按用途分组：
+#   1) 运行时保护：超时降级、逐片兜底；
+#   2) 图读写与几何工具（所有距离都换算成 µm）；
+#   3) 读取原始影像、合成中点的亮度质心精修；
+#   4) DeepCenter 中心先验模型：否决后处理“新增”的东西，并给分裂补全打分器提供图像特征；
+#   5) 全局位移估计 + flow 重链接（结果替换全部 ILP 边）；
+#   6) 单帧缺口闭合、严格两帧缺口；
+#   7) 低分峰池与找回。
+# 执行顺序见本段后半部分的 filter_output_graph：边过滤 → 重链接 → 找回 →（找回了节点时）第二次重链接 → 单父修复
+#   → 单帧缺口闭合 → 严格两帧缺口 → 低分峰补缺 → 安全分裂 + 分裂补全打分器 → 删除孤立节点 → 删除短轨迹
+#   → 线拟合平滑（含跳变感知平滑）。
+import tracksdata as td
+import numpy as np
+import blosc2
+# linear_sum_assignment 是匈牙利算法：给定代价矩阵，求总代价最小的一对一匹配（重链接、缺口闭合都用它）。
+# cKDTree 是 KD 树，用来高效回答“某点 r µm 内有哪些点”“离某点最近的 k 个点”这类近邻查询。
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial import cKDTree
+
+# 提交 CSV 的列：节点行（row_type = "node"，填 node_id 与 t/z/y/x）和边行（row_type = "edge"，填 source_id/target_id）
+#   共用一张表，用不到的列填 -1；每行另有一个全局递增的 id。
+SUBMISSION_COLUMNS = ["dataset", "row_type", "node_id", "t", "z", "y", "x", "source_id", "target_id"]
+CSV_COLUMNS = ["id", *SUBMISSION_COLUMNS]
+# 原始体素的物理尺寸（z, y, x，单位 µm）：z 层间距 1.625 µm，y/x 像素 0.40625 µm，z 方向粗 4 倍。
+# 后处理里节点坐标是原始体素下标，比较距离前都先乘这个尺度换成 µm，否则 z 方向的 1 格会被当成和 y/x 的 1 格一样近。
+# 官方指标也按同一尺度在每帧内做 7 µm 的一对一匹配，所以下面所有门限都直接以 µm 计。
+VOXEL_SCALE_UM = (1.625, 0.40625, 0.40625)
+
+import time as _time
+import traceback as _traceback
+
+# ---- 运行时保护 ----
+# Kaggle 评分时会用更大的隐藏测试集重跑本 notebook，总时限 12 小时，超时就没有成绩。所以后处理循环盯着墙钟：
+#   从第 0 段记下的启动时刻（BIOHUB_KERNEL_START_TS）算起，超过 REPAIR_DEADLINE_S 后，剩下的影像关闭可选的
+#   修复步骤（见 _deadline_degrade）；某段影像的后处理一旦抛异常，就改用它的 ILP 图做最简单的过滤后写出
+#   （见 fallback_output_graph），而不是让整个 notebook 失败。
+KERNEL_START_TS = float(os.environ.get("BIOHUB_KERNEL_START_TS", str(_time.time())))
+# 代码里的缺省值 27000 s（7.5 h）是公开基线的设置（公开基线只跑一遍后处理）；第 0 段把它设为 41400 s（11.5 h）：
+#   本管线在隐藏集上要跑两遍后处理，若在 7.5 h 降级，第二遍（即最终提交）后面的影像就会关掉重链接、缺口闭合等主要修复步骤。
+REPAIR_DEADLINE_S = float(os.environ.get("BIOHUB_REPAIR_DEADLINE_S", "27000"))
+# 原始影像帧缓存最多保留 48 帧（FRAME_CACHE_MAX_FRAMES），控制内存；_deadline_degraded 记录是否已经降级。
+FRAME_CACHE_MAX_FRAMES = int(os.environ.get("BIOHUB_FRAME_CACHE_MAX_FRAMES", "48"))
+_deadline_degraded = False
+
+
+# dict 按插入顺序迭代，弹出第一个键 = 淘汰最早读入的帧（先进先出）。
+def _frame_cache_trim(frame_cache: dict[int, np.ndarray]) -> None:
+    while len(frame_cache) > max(1, FRAME_CACHE_MAX_FRAMES):
+        frame_cache.pop(next(iter(frame_cache)))
+
+
+# 超时降级：把 flow 重链接、单帧缺口闭合、严格两帧缺口、安全分裂、线拟合平滑这 5 个开关置为 False。
+#   它们是模块级全局量，一旦降级，对之后所有影像（包括后面的各遍后处理）都生效。
+#   找回只在重链接产生了边时才运行，因此随之失效；低分峰补缺只看 GAPFILL_MAX_GAP，不受影响。
+#   分裂补全打分器包在安全分裂外面、不看这些开关，所以最终一遍降级后它仍会运行；删除孤立节点也照常进行。
+#   打印信息里的“只做边过滤和短轨迹过滤”是简化说法。
+def _deadline_degrade() -> None:
+    global _deadline_degraded, OUTPUT_MOTION_RELINK, OUTPUT_GAP_CLOSE, OUTPUT_GAP2_RECOVERY
+    global OUTPUT_SAFE_DIVISIONS, OUTPUT_LINEFIT_SMOOTH
+    _deadline_degraded = True
+    OUTPUT_MOTION_RELINK = False
+    OUTPUT_GAP_CLOSE = False
+    OUTPUT_GAP2_RECOVERY = False
+    OUTPUT_SAFE_DIVISIONS = False
+    OUTPUT_LINEFIT_SMOOTH = False
+    print(
+        f"DEADLINE: {_time.time() - KERNEL_START_TS:.0f}s since kernel start exceeds"
+        f" {REPAIR_DEADLINE_S:.0f}s; remaining datasets get edge filtering and"
+        " short-track filtering only",
+        flush=True,
+    )
+
+
+# 逐片兜底：某段影像的 filter_output_graph 抛异常时，write_test_submission 改用这里的结果：
+#   ① 只保留 ILP 给出的相邻帧（t → t+1）、长度 ≤ OUTPUT_EDGE_MAX_UM（14 µm）的边；
+#   ② 每个目标节点按 edge_sort_key（先比概率、再比距离）只留一条入边（单父）；
+#   ③ 每个源节点最多留两条出边（一次分裂最多两个子细胞）；
+#   ④ 只输出有边的节点；若一条边都不剩，就保留全部节点，免得这段影像在提交里缺席。
+# 原理：一段影像出错只让这一段少做修复，不能拖垮整份提交；输出仍满足提交格式的约束（单父、出度 ≤ 2、只连相邻帧）。
+def fallback_output_graph(
+    nodes_by_id: dict[int, dict[str, object]],
+    raw_edges: list[dict[str, object]],
+) -> tuple[dict[int, dict[str, object]], list[dict[str, object]], dict[str, int]]:
+    """从 ILP 输出构造“最便宜的合法图”：只留相邻帧、不超过 OUTPUT_EDGE_MAX_UM 的边，
+    每个节点最多一个父节点、最多两个子节点。"""
+    stats: dict[str, int] = {"raw_edges": len(raw_edges), "repair_fallback": 1}
+    edges: list[dict[str, object]] = []
+    for edge in raw_edges:
+        source = nodes_by_id.get(int(edge["source_id"]))
+        target = nodes_by_id.get(int(edge["target_id"]))
+        if source is None or target is None:
+            continue
+        if int(target["t"]) != int(source["t"]) + 1:
+            continue
+        edge["distance_um"] = edge_distance_um(source, target)
+        if OUTPUT_EDGE_MAX_UM > 0 and float(edge["distance_um"]) > OUTPUT_EDGE_MAX_UM:
+            continue
+        edges.append(edge)
+    best_by_target: dict[int, dict[str, object]] = {}
+    for edge in edges:
+        target_id = int(edge["target_id"])
+        prev = best_by_target.get(target_id)
+        if prev is None or edge_sort_key(edge) > edge_sort_key(prev):
+            best_by_target[target_id] = edge
+    by_source: dict[int, list[dict[str, object]]] = {}
+    for edge in best_by_target.values():
+        by_source.setdefault(int(edge["source_id"]), []).append(edge)
+    edges = []
+    for source_edges in by_source.values():
+        edges.extend(sorted(source_edges, key=edge_sort_key, reverse=True)[:2])
+    incident = {int(e["source_id"]) for e in edges} | {int(e["target_id"]) for e in edges}
+    kept = {node_id: node for node_id, node in nodes_by_id.items() if node_id in incident}
+    return (kept or nodes_by_id), edges, stats
+
+
+# ---- 图读写与几何工具 ----
+# GEFF 是竞赛使用的图文件格式（Zarr 容器里存节点表和边表）。第 4 段的推理子进程为每段影像写出一张 ILP 结果图，
+#   这里用 tracksdata 读回（返回值可能是元组，此时取第 0 个元素）。读出的节点带 t/z/y/x，边带 edge_prob。
+def graph_from_geff(path: Path):
+    graph = td.graph.IndexedRXGraph.from_geff(path)
+    return graph[0] if isinstance(graph, tuple) else graph
+
+
+# 两个节点 / 两个点之间的物理距离（µm）：各轴先乘体素尺寸，再求欧氏距离。
+def edge_distance_um(source: dict[str, object], target: dict[str, object]) -> float:
+    dz = (float(source["z"]) - float(target["z"])) * VOXEL_SCALE_UM[0]
+    dy = (float(source["y"]) - float(target["y"])) * VOXEL_SCALE_UM[1]
+    dx = (float(source["x"]) - float(target["x"])) * VOXEL_SCALE_UM[2]
+    return math.sqrt(dz * dz + dy * dy + dx * dx)
+
+
+def point_distance_um(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+    dz = (a[0] - b[0]) * VOXEL_SCALE_UM[0]
+    dy = (a[1] - b[1]) * VOXEL_SCALE_UM[1]
+    dx = (a[2] - b[2]) * VOXEL_SCALE_UM[2]
+    return math.sqrt(dz * dz + dy * dy + dx * dx)
+
+
+# 节点 → 体素坐标 (z, y, x)。
+def node_point(node: dict[str, object]) -> tuple[float, float, float]:
+    return (float(node["z"]), float(node["y"]), float(node["x"]))
+
+
+# 边的优先级键：先比模型概率 p（没有概率的边，例如缺口闭合新加的边，按 0 计），概率相同再比距离（越短越好）。
+#   凡是“一个节点只能留一条边”的场合（兜底输出、单父修复等）都用它挑出最好的一条。
+def edge_sort_key(edge: dict[str, object]) -> tuple[float, float]:
+    prob = edge.get("edge_prob")
+    prob_value = float(prob) if prob is not None else 0.0
+    return prob_value, -float(edge["distance_um"])
+
+
+# 新节点（合成中点、找回的峰）的 id：当前最大 id + 1，保证同一段影像内 id 唯一。
+def _next_node_id(nodes_by_id: dict[int, dict[str, object]]) -> int:
+    return max(nodes_by_id) + 1 if nodes_by_id else 1
+
+
+
+# ---- 读取原始影像 ----
+# 读一帧原始 3D 影像（供合成中点精修和 DeepCenter 热图使用），结果放进调用方传入的 frame_cache（键为 t）。
+# 注意：它在调用时才读取全局变量 TEST_DIR。要在训练影像上复用后处理，必须先把 TEST_DIR 指向 train 目录
+#   （第 9 段的本地验证器就是这样做的），否则找不到对应的影像文件。
+def read_test_frame(dataset: str, t: int, frame_cache: dict[int, np.ndarray]) -> np.ndarray:
+    if t in frame_cache:
+        return frame_cache[t]
+    zarr_path = TEST_DIR / f"{dataset}.zarr"
+    meta = json.loads((zarr_path / "0" / "zarr.json").read_text())
+    shape = tuple(int(v) for v in meta["shape"])
+    dtype = np.dtype(meta["data_type"])
+    frame_shape = shape[1:]
+    # 快速路径：竞赛数据是 Zarr v3，每帧正好存成一个分块（<影像>.zarr/0/c/<t>/0/0/0），
+    #   直接读这个文件并用 blosc2 解压，比经过 zarr 库快；尺寸不符或出错时走下面的退回路径。
+    chunk_path = zarr_path / "0" / "c" / str(t) / "0" / "0" / "0"
+    try:
+        raw = chunk_path.read_bytes()
+        arr = np.frombuffer(blosc2.decompress(raw), dtype=dtype)
+        if arr.size == int(np.prod(frame_shape)):
+            frame = arr.reshape(frame_shape).copy()
+            frame_cache[t] = frame
+            _frame_cache_trim(frame_cache)
+            return frame
+    except Exception:
+        pass
+    # 退回路径：用 zarr 库按时间下标读取（慢一些，但不依赖分块布局）。
+    import zarr
+    frame = np.asarray(zarr.open(zarr_path / "0", mode="r")[t])
+    frame_cache[t] = frame
+    _frame_cache_trim(frame_cache)
+    return frame
+
+
+# 合成中点的亮度质心精修：缺口闭合插入的中点只是前后两点的线性插值，细胞核未必正好在那里。
+#   细胞核在荧光影像中是一团亮斑，所以在插值点周围取 z ±1 层（GAP_REFINE_WIN_Z，约 ±1.6 µm）、
+#   y/x ±3 像素（GAP_REFINE_WIN_YX，约 ±1.2 µm）的小窗，用“高出背景的亮度”做权重求加权质心，把点拉向亮斑中心。
+#   若移动超过 GAP_REFINE_MAX_SHIFT_UM（3.2 µm），多半是被旁边的细胞吸走了，放弃精修、保留插值点；
+#   任何异常也保留插值点。单帧缺口闭合与严格两帧缺口新建的节点都经过这一步。
+def refine_synthetic_midpoint(
+    dataset: str | None,
+    t: int,
+    midpoint: tuple[float, float, float],
+    frame_cache: dict[int, np.ndarray],
+    stats: dict[str, int],
+) -> tuple[float, float, float]:
+    if not GAP_REFINE_SYNTHETIC or dataset is None:
+        return midpoint
+    try:
+        frame = read_test_frame(dataset, t, frame_cache)
+        z, y, x = [int(round(v)) for v in midpoint]
+        z0 = max(0, z - GAP_REFINE_WIN_Z)
+        z1 = min(frame.shape[0], z + GAP_REFINE_WIN_Z + 1)
+        y0 = max(0, y - GAP_REFINE_WIN_YX)
+        y1 = min(frame.shape[1], y + GAP_REFINE_WIN_YX + 1)
+        x0 = max(0, x - GAP_REFINE_WIN_YX)
+        x1 = min(frame.shape[2], x + GAP_REFINE_WIN_YX + 1)
+        patch = frame[z0:z1, y0:y1, x0:x1].astype(np.float64)
+        if patch.size == 0:
+            stats["gap_refine_failed"] += 1
+            return midpoint
+        # 背景 = 窗口内第 20 百分位亮度；只有高出背景的部分参与加权，暗背景不会把质心拉向窗口中心。
+        baseline = float(np.percentile(patch, 20.0))
+        weights = np.maximum(patch - baseline, 0.0)
+        total = float(weights.sum())
+        if total <= 0:
+            stats["gap_refine_failed"] += 1
+            return midpoint
+        zz = np.arange(z0, z1, dtype=np.float64)[:, None, None]
+        yy = np.arange(y0, y1, dtype=np.float64)[None, :, None]
+        xx = np.arange(x0, x1, dtype=np.float64)[None, None, :]
+        refined = (
+            float((weights * zz).sum() / total),
+            float((weights * yy).sum() / total),
+            float((weights * xx).sum() / total),
+        )
+        if point_distance_um(refined, midpoint) > GAP_REFINE_MAX_SHIFT_UM:
+            stats["gap_refine_rejected_shift"] += 1
+            return midpoint
+        stats["gap_refined_synthetic"] += 1
+        return refined
+    except Exception:
+        stats["gap_refine_failed"] += 1
+        return midpoint
+
+
+
+# ---- DeepCenter 中心先验模型 ----
+# DeepCenter 是公开方案提供的另一个 3D U-Net（公开数据集 biohub-deepcenter-unet3d-center-prior-v1），输出“中心先验”
+#   热图：每个体素是细胞核中心的概率。本管线只用它推理、不训练，用途有两个：
+#   ① 否决后处理新增的、不可信的东西（单帧缺口闭合的合成中点、安全分裂要新连上的子细胞）；
+#   ② 作为分裂补全打分器的图像特征。
+# 预处理第一步：只在 y/x 方向做 pool_factor 倍平均池化（取自 checkpoint 配置，缺省 4）。0.40625 × 4 = 1.625 µm，
+#   与 z 层间距相同，网络看到的是近似各向同性的体素；256×256 的平面缩成 64×64，计算量也小得多。
+def _dc_pool_frame_xy(volume: np.ndarray, factor: int) -> np.ndarray:
+    if factor <= 1:
+        return volume.astype(np.float32, copy=False)
+    z, y, x = volume.shape
+    y2 = (y // factor) * factor
+    x2 = (x // factor) * factor
+    cropped = volume[:, :y2, :x2].astype(np.float32, copy=False)
+    return cropped.reshape(z, y2 // factor, factor, x2 // factor, factor).mean(axis=(2, 4))
+
+
+# 按分位数归一化：第 50 百分位（背景，norm_lo_pct）映射到 0，第 99.5 百分位（最亮的细胞核，norm_hi_pct）映射到 1，
+#   再截断到 [-0.5, 6]（这些是缺省值，都可由 checkpoint 配置覆盖）。不同影像、不同时间点的整体亮度差别很大，
+#   这样归一化后网络的输入分布与训练时一致。分位数异常（非有限或上下颠倒）时返回全 0。
+def _dc_normalize_dynamic_range(volume: np.ndarray, cfg: object) -> np.ndarray:
+    vol = np.asarray(volume, dtype=np.float32)
+    lo = float(np.percentile(vol, float(getattr(cfg, "norm_lo_pct", 50.0))))
+    hi = float(np.percentile(vol, float(getattr(cfg, "norm_hi_pct", 99.5))))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return np.zeros_like(vol, dtype=np.float32)
+    ratio = (vol - lo) / (hi - lo)
+    return np.clip(
+        ratio,
+        float(getattr(cfg, "norm_clip_lo", -0.5)),
+        float(getattr(cfg, "norm_clip_hi", 6.0)),
+    ).astype(np.float32)
+
+
+# 从数据集的 ARTIFACT_MANIFEST.json 里解析权重文件路径（兼容 manifest 的几种写法），再补上几个约定的文件名。
+def _dc_manifest_weight_paths(manifest_path: Path) -> list[Path]:
+    if not manifest_path.exists():
+        return []
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except Exception as exc:
+        print("Could not read DeepCenter manifest:", manifest_path, type(exc).__name__, exc)
+        return []
+    root = manifest_path.parent
+    sections: list[dict[str, object]] = []
+    for section in [
+        manifest.get("model", {}),
+        manifest.get("models", {}).get("full_frame_center", {}) if isinstance(manifest.get("models", {}), dict) else {},
+        manifest.get("full_frame_center", {}),
+    ]:
+        if isinstance(section, dict):
+            sections.append(section)
+    candidates: list[Path] = []
+    for section in sections:
+        for key in ("weight_path", "path"):
+            rel = section.get(key)
+            if isinstance(rel, str) and rel:
+                candidates.append(root / rel)
+        for key in ("last_checkpoint", "best_checkpoint"):
+            item = section.get(key)
+            if isinstance(item, dict):
+                rel = item.get("path")
+                if isinstance(rel, str) and rel:
+                    candidates.append(root / rel)
+    for name in ("checkpoint_last.pt", "best.pt", "last.pt"):
+        candidates.append(root / "weights" / "full_frame_center" / name)
+        candidates.append(root / name)
+    candidates.append(root / DEEPCENTER_RELATIVE)
+    return candidates
+
+
+# 按优先级列出 DeepCenter 权重的候选路径：
+#   ① 环境变量 BIOHUB_DEEPCENTER_CHECKPOINT（第 3 段已把它改写为通过 SHA256 校验的实际文件路径）；
+#   ② manifest 里登记的路径；
+#   ③ Kaggle 挂载数据集的两种目录布局（/kaggle/input/<数据集名> 与 /kaggle/input/datasets/<作者>/<数据集名>）；
+#   ④ 只有以上路径一个都不存在时，才递归搜索整个 /kaggle/input（很慢）。
+# 最后按真实路径去重，保持优先级顺序。
+def _dc_checkpoint_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    explicit = os.environ.get("BIOHUB_DEEPCENTER_CHECKPOINT", DEEPCENTER_CHECKPOINT_DEFAULT).strip()
+    if explicit:
+        candidates.append(Path(explicit))
+    manifest_explicit = os.environ.get("BIOHUB_DEEPCENTER_MANIFEST", DEEPCENTER_MANIFEST_DEFAULT).strip()
+    if manifest_explicit:
+        candidates.extend(_dc_manifest_weight_paths(Path(manifest_explicit)))
+
+    input_root = Path("/kaggle/input")
+    preferred_dirs = [
+        Path("/kaggle/input/biohub-deepcenter-unet3d-center-prior-v1"),
+        Path("/kaggle/input/datasets/pilkwang/biohub-deepcenter-unet3d-center-prior-v1"),
+    ]
+    for directory in preferred_dirs:
+        candidates.extend(_dc_manifest_weight_paths(directory / "ARTIFACT_MANIFEST.json"))
+        for name in ("checkpoint_last.pt", "best.pt", "last.pt"):
+            candidates.append(directory / "weights" / "full_frame_center" / name)
+            candidates.append(directory / name)
+    if input_root.exists() and not any(path.is_file() for path in candidates):
+        # 递归遍历 /kaggle/input 三次，在可见测试集上要花约 370 s。显式的 checkpoint 路径已由第 3 段的
+        # SHA256 校验钉死，所以只在已知路径都不存在时才遍历。
+        for name in ("checkpoint_last.pt", "best.pt", "last.pt"):
+            candidates.extend(sorted(input_root.glob(f"**/full_frame_center/**/{name}")))
+
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for path in candidates:
+        path = path.expanduser()
+        try:
+            key = path.resolve() if path.exists() else path
+        except Exception:
+            key = path
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+# torch 不可用时，网络类定义为 None；加载函数会据此报错（要求否决门时）或跳过。
+try:
+    import torch
+except Exception as _dc_torch_error:
+    torch = None
+
+
+# DeepCenter 网络结构（必须与 checkpoint 完全一致才能加载权重）：
+#   基本块 = 两层 3×3×3 卷积（无偏置）+ GroupNorm + SiLU；GroupNorm 不依赖 batch 大小，一次只送一帧也稳定。
+#   3 级 U-Net：编码通道 c → 2c → 4c（缺省 c = 24，即 24 → 48 → 96），每级之后 2 倍最大池化，瓶颈 8c（192）；
+#   解码用 2 倍转置卷积上采样，再与同级编码特征拼接（跳连，把细节位置信息带回高分辨率）；
+#   最后 1×1×1 卷积输出 1 通道 logit，sigmoid 后即“是细胞中心”的概率。
+if torch is not None:
+    class _DCConvBlock3d(torch.nn.Module):
+        def __init__(self, in_channels: int, out_channels: int) -> None:
+            super().__init__()
+            groups = min(8, out_channels)
+            self.block = torch.nn.Sequential(
+                torch.nn.Conv3d(in_channels, out_channels, 3, padding=1, bias=False),
+                torch.nn.GroupNorm(groups, out_channels),
+                torch.nn.SiLU(inplace=True),
+                torch.nn.Conv3d(out_channels, out_channels, 3, padding=1, bias=False),
+                torch.nn.GroupNorm(groups, out_channels),
+                torch.nn.SiLU(inplace=True),
+            )
+
+        def forward(self, x):
+            return self.block(x)
+
+
+    class _DCDeepCenterUNet3D(torch.nn.Module):
+        def __init__(self, in_channels: int = 1, base_channels: int = 24) -> None:
+            super().__init__()
+            c = int(base_channels)
+            self.enc1 = _DCConvBlock3d(in_channels, c)
+            self.down1 = torch.nn.MaxPool3d(2, 2)
+            self.enc2 = _DCConvBlock3d(c, c * 2)
+            self.down2 = torch.nn.MaxPool3d(2, 2)
+            self.enc3 = _DCConvBlock3d(c * 2, c * 4)
+            self.down3 = torch.nn.MaxPool3d(2, 2)
+            self.bottleneck = _DCConvBlock3d(c * 4, c * 8)
+            self.up3 = torch.nn.ConvTranspose3d(c * 8, c * 4, 2, 2)
+            self.dec3 = _DCConvBlock3d(c * 8, c * 4)
+            self.up2 = torch.nn.ConvTranspose3d(c * 4, c * 2, 2, 2)
+            self.dec2 = _DCConvBlock3d(c * 4, c * 2)
+            self.up1 = torch.nn.ConvTranspose3d(c * 2, c, 2, 2)
+            self.dec1 = _DCConvBlock3d(c * 2, c)
+            self.head = torch.nn.Conv3d(c, 1, 1)
+
+        def forward(self, x):
+            e1 = self.enc1(x)
+            e2 = self.enc2(self.down1(e1))
+            e3 = self.enc3(self.down2(e2))
+            b = self.bottleneck(self.down3(e3))
+            d3 = self.dec3(torch.cat([self.up3(b), e3], dim=1))
+            d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+            d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+            return self.head(d1)
+else:
+    _DCConvBlock3d = None
+    _DCDeepCenterUNet3D = None
+
+# 加载 DeepCenter：按优先级逐个尝试候选 checkpoint，要求是含 model_state 的字典，且训练轮次 epoch 必须等于
+#   DEEPCENTER_EXPECTED_EPOCH（第 0 段设为 2），防止误载同一数据集里的其他版本；用 checkpoint 自带的 config 建网络，
+#   有 GPU 用 GPU，否则用 CPU。打印信息里的 add-only repair gate 就是下面的“只否决新增”的门。
+# REQUIRE_DEEPCENTER_VETO = 1（第 0 段）时找不到可用权重就直接报错，而不是悄悄关掉否决门：否决门一关，
+#   缺口闭合与安全分裂会多出未经确认的节点 / 分叉，结果就和预期不一样了。
+# 返回 bundle 字典（model / cfg / device / path / torch）；本段后半部分加载一次，供所有影像共用。
+def load_deepcenter_veto_detector() -> dict[str, object] | None:
+    if not USE_DEEPCENTER_VETO:
+        print("DeepCenter add-only repair gate disabled by configuration.")
+        return None
+    if torch is None:
+        if REQUIRE_DEEPCENTER_VETO:
+            raise ImportError("torch is required for DeepCenter add-only repair gate")
+        print("DeepCenter add-only repair gate skipped because torch is unavailable.")
+        return None
+    from types import SimpleNamespace
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    load_errors: list[str] = []
+    for checkpoint_path in _dc_checkpoint_candidates():
+        if not checkpoint_path.exists():
+            continue
+        try:
+            print("Trying DeepCenter add-only gate checkpoint:", checkpoint_path)
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            if not isinstance(checkpoint, dict) or "model_state" not in checkpoint:
+                raise ValueError("checkpoint has no model_state")
+            checkpoint_epoch = int(checkpoint.get("epoch", -1))
+            if DEEPCENTER_EXPECTED_EPOCH > 0 and checkpoint_epoch != DEEPCENTER_EXPECTED_EPOCH:
+                raise ValueError(
+                    f"expected DeepCenter epoch {DEEPCENTER_EXPECTED_EPOCH}, got {checkpoint_epoch}"
+                )
+            cfg = SimpleNamespace(**checkpoint.get("config", {}))
+            model = _DCDeepCenterUNet3D(base_channels=int(getattr(cfg, "base_channels", 24)))
+            model.load_state_dict(checkpoint["model_state"])
+            model.to(device)
+            model.eval()
+            print("Loaded DeepCenter add-only gate checkpoint:", checkpoint_path)
+            print("DeepCenter checkpoint epoch:", checkpoint.get("epoch"), "best_score:", checkpoint.get("best_score"))
+            return {
+                "model": model,
+                "cfg": cfg,
+                "device": device,
+                "path": checkpoint_path,
+                "torch": torch,
+            }
+        except Exception as exc:
+            load_errors.append(f"{checkpoint_path}: {type(exc).__name__}: {exc}")
+            print("Skipping incompatible DeepCenter checkpoint:", checkpoint_path, "|", type(exc).__name__, exc)
+    message = "No usable DeepCenter checkpoint found for add-only repair gate."
+    if REQUIRE_DEEPCENTER_VETO:
+        checked = "\n".join(str(p) for p in _dc_checkpoint_candidates()[:80])
+        errors = "\n".join(load_errors[-20:])
+        raise FileNotFoundError(message + "\nChecked:\n" + checked + ("\nLoad errors:\n" + errors if errors else ""))
+    print(message)
+    return None
+
+
+# 热图缓存：键为 (影像名, t)，先进先出。上限 DEEPCENTER_SCORE_CACHE_MAX_FRAMES 在第 2 段缺省为 8，
+#   本段后半部分（分裂补全打分器之前）改为 128；这里在调用时才读取全局值，所以实际按 128 帧缓存。
+def _dc_cache_trim(cache: dict[tuple[str, int], np.ndarray]) -> None:
+    limit = max(1, int(DEEPCENTER_SCORE_CACHE_MAX_FRAMES))
+    while len(cache) > limit:
+        cache.pop(next(iter(cache)))
+
+
+# 计算一帧的 DeepCenter 热图：读原始帧 → y/x 池化 → 分位数归一化 → 网络前向得 logit →（可选 TTA）→ sigmoid。
+#   结果按 (影像, t) 缓存，同一帧被多次查询时只算一次。
+def deepcenter_heatmap_for_frame(
+    dataset: str,
+    t: int,
+    detector_bundle: dict[str, object] | None,
+    frame_cache: dict[int, np.ndarray],
+    heatmap_cache: dict[tuple[str, int], np.ndarray],
+) -> np.ndarray | None:
+    if detector_bundle is None:
+        return None
+    key = (dataset, int(t))
+    cached = heatmap_cache.get(key)
+    if cached is not None:
+        return cached
+    model = detector_bundle["model"]
+    cfg = detector_bundle["cfg"]
+    device = detector_bundle["device"]
+    torch_mod = detector_bundle["torch"]
+    pool_factor = int(getattr(cfg, "pool_factor", 4))
+    volume = read_test_frame(dataset, int(t), frame_cache)
+    pooled = _dc_pool_frame_xy(volume, pool_factor)
+    image = _dc_normalize_dynamic_range(pooled, cfg)
+    with torch_mod.no_grad():
+        tensor = torch_mod.from_numpy(image[None, None, ...]).to(device=device, dtype=torch_mod.float32)
+        logits = model(tensor)
+        # 测试时增强（TTA，第 0 段设 BIOHUB_DEEPCENTER_TTA = 1 打开）：细胞核在 y-x 平面内没有固定朝向，
+        #   把输入在 y-x 平面内翻转 / 旋转后分别前向，输出再逆变换回原坐标，对 logit 求平均，单次预测的噪声就被平均掉。
+        #   视角：原图 + x 翻转、y 翻转、xy 翻转；若 y、x 尺寸相等（池化后都是 64，成立），再加 90° 与 270° 旋转、转置、
+        #   “先旋转 90° 再转置”，共 nv = 8 个。最后一个在数学上恰好等于 x 翻转（与第 4 段检测 TTA 的情况相同），
+        #   所以实际是 7 个不同视角、x 翻转的权重加倍。
+        #   若平均后的 logit 与单视角完全相同，说明 TTA 没有生效，直接报错，避免“以为开了其实没开”。
+        if os.environ.get("BIOHUB_DEEPCENTER_TTA", "0") != "0":
+            acc = logits.clone(); nv = 1
+            for dims in [(-1,), (-2,), (-2, -1)]:
+                acc = acc + model(tensor.flip(dims)).flip(dims); nv += 1
+            if tensor.shape[-1] == tensor.shape[-2]:
+                for k in (1, 3):
+                    acc = acc + torch_mod.rot90(model(torch_mod.rot90(tensor, k, dims=(-2, -1))), -k, dims=(-2, -1)); nv += 1
+                acc = acc + model(tensor.transpose(-1, -2)).transpose(-1, -2); nv += 1
+                at = torch_mod.rot90(tensor, 1, dims=(-2, -1)).transpose(-1, -2)
+                acc = acc + torch_mod.rot90(model(at).transpose(-1, -2), -1, dims=(-2, -1)); nv += 1
+            delta = float((acc / nv - logits).abs().mean())
+            if delta == 0.0:
+                raise RuntimeError("DEEPCENTER_TTA_NO_OP: averaged veto logits identical to the single view")
+            if not getattr(deepcenter_heatmap_for_frame, "_tta_announced", False):
+                print("DEEPCENTER_TTA_ACTIVE views=", nv, "mean_abs_logit_delta=", round(delta, 6), flush=True)
+                deepcenter_heatmap_for_frame._tta_announced = True
+            logits = acc / nv
+        heatmap = torch_mod.sigmoid(logits)[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+    heatmap_cache[key] = heatmap
+    _dc_cache_trim(heatmap_cache)
+    return heatmap
+
+
+# 查询某个点的中心先验分数：z 不缩放（只在 y/x 池化过），y、x 除以 pool_factor 换到池化网格；
+#   在 z ±1（DEEPCENTER_SCORE_WIN_Z）、y/x ±2（DEEPCENTER_SCORE_WIN_YX）个池化像素的小窗内取最大值，
+#   约 ±1.6 µm / ±3.3 µm。取窗口最大值而不是单点值，是为了容忍插值点与真实中心之间的小偏差。
+#   分裂补全打分器也调用它，把分数当作图像特征。拿不到热图时返回 None。
+def deepcenter_score_point(
+    dataset: str | None,
+    t: int,
+    point: tuple[float, float, float],
+    detector_bundle: dict[str, object] | None,
+    frame_cache: dict[int, np.ndarray],
+    heatmap_cache: dict[tuple[str, int], np.ndarray],
+) -> float | None:
+    if not USE_DEEPCENTER_VETO or detector_bundle is None or dataset is None:
+        return None
+    heatmap = deepcenter_heatmap_for_frame(dataset, int(t), detector_bundle, frame_cache, heatmap_cache)
+    if heatmap is None or heatmap.size == 0:
+        return None
+    cfg = detector_bundle["cfg"]
+    pool_factor = int(getattr(cfg, "pool_factor", 4))
+    z = int(round(float(point[0])))
+    y = int(round(float(point[1]) / max(pool_factor, 1)))
+    x = int(round(float(point[2]) / max(pool_factor, 1)))
+    z0, z1 = max(0, z - DEEPCENTER_SCORE_WIN_Z), min(heatmap.shape[0], z + DEEPCENTER_SCORE_WIN_Z + 1)
+    y0, y1 = max(0, y - DEEPCENTER_SCORE_WIN_YX), min(heatmap.shape[1], y + DEEPCENTER_SCORE_WIN_YX + 1)
+    x0, x1 = max(0, x - DEEPCENTER_SCORE_WIN_YX), min(heatmap.shape[2], x + DEEPCENTER_SCORE_WIN_YX + 1)
+    patch = heatmap[z0:z1, y0:y1, x0:x1]
+    if patch.size == 0:
+        return None
+    score = float(np.max(patch))
+    return score if np.isfinite(score) else None
+
+
+# “只否决新增”的门（代码和打印里叫 add-only repair gate）：只有后处理要新加的东西才过这道门——
+#   单帧缺口闭合的合成中点（prefix = "gap"，阈值 DEEPCENTER_GAP_THRESHOLD，第 0 段设为 0.25），以及
+#   安全分裂要新加的那条母→子边（prefix = "safe_div"，阈值 DEEPCENTER_SAFE_DIV_THRESHOLD = 0.25；查的是候选第二个
+#   子细胞所在位置的分数，它是一个已有的、没有父节点的轨迹起点）。门只决定“加不加”，从不删除已有的节点或边。
+#   分数低于阈值才拒绝；模型缺失或拿不到分数时放行（并计数）。
+# 原理：DeepCenter 是独立训练的模型，为“这里确实有一个细胞核”提供第二份证据，以很小的代价控制新增内容的精度——
+#   假的合成节点连不出正确的边，还会被指标的节点数调整项（预测节点越多，边 Jaccard 打的折扣越大）拉低分数；
+#   假的分叉则直接变成错边和假分裂。
+def deepcenter_accept_repair_point(
+    dataset: str | None,
+    t: int,
+    point: tuple[float, float, float],
+    detector_bundle: dict[str, object] | None,
+    frame_cache: dict[int, np.ndarray],
+    heatmap_cache: dict[tuple[str, int], np.ndarray],
+    stats: dict[str, int],
+    prefix: str,
+    threshold: float,
+) -> bool:
+    if not USE_DEEPCENTER_VETO:
+        return True
+    if detector_bundle is None or dataset is None:
+        stats[f"deepcenter_{prefix}_missing"] += 1
+        return True
+    stats[f"deepcenter_{prefix}_checked"] += 1
+    score = deepcenter_score_point(dataset, int(t), point, detector_bundle, frame_cache, heatmap_cache)
+    if score is None:
+        stats[f"deepcenter_{prefix}_missing"] += 1
+        return True
+    if score < float(threshold):
+        stats[f"deepcenter_{prefix}_rejected"] += 1
+        return False
+    stats[f"deepcenter_{prefix}_accepted"] += 1
+    return True
+
+# 节点坐标 → µm 向量 (z, y, x)。
+def _position_um(node: dict[str, object]) -> np.ndarray:
+    return np.array(
+        [float(node["z"]) * VOXEL_SCALE_UM[0], float(node["y"]) * VOXEL_SCALE_UM[1], float(node["x"]) * VOXEL_SCALE_UM[2]],
+        dtype=np.float64,
+    )
+
+
+# ---- 全局位移估计（本方案新增）----
+# 有些帧对之间，整个视野里的细胞一起平移好几 µm（载物台漂移或胚胎整体移动）。下面的 flow 重链接靠“上一帧对的
+#   邻居位移场”预测本帧位置，遇到这种整帧跳变就预测不准：种子匹配整体出错，由种子建出的位移场也跟着错。
+# 两个阈值的代码缺省值都是 0（= 关闭），第 0 段都设为 3.0 µm：
+#   MOTION_RELINK_GLOBAL_SEED_MIN_UM：整体位移 ≥ 3 µm 才算整帧跳变，重链接的种子轮改用整体位移来预测位置；
+#   OUTPUT_LINEFIT_JUMP_MIN_UM：本段后面的跳变感知平滑判定整帧跳变用的阈值。
+# 开关 _G1X1_ACTIVE 由全局位移估计与跳变感知平滑共用，这里定义为 False，只在第 11 段的最终一遍后处理
+#   （以及可见测试集上的诊断一遍）中打开；第一遍后处理不受影响。
+MOTION_RELINK_GLOBAL_SEED_MIN_UM = float(os.environ.get("BIOHUB_MOTION_RELINK_GLOBAL_SEED_MIN_UM", "0"))
+OUTPUT_LINEFIT_JUMP_MIN_UM = float(os.environ.get("BIOHUB_OUTPUT_LINEFIT_JUMP_MIN_UM", "0"))
+_G1X1_ACTIVE = False
+
+
+# 估计两帧之间的整体平移。原理类似霍夫投票：整帧平移 s 时，每个细胞到“它自己在下一帧的位置”的位移都约等于 s，
+#   这些真实配对全部落进同一个直方图箱；而每个细胞与 15 µm 内其他细胞组成的错误配对，位移在 15 µm 的球内
+#   大致均匀散开，摊到很多箱里。所以计数最多的箱就是 s，完全不需要链接概率。
+# 细节：箱宽 1.625 µm（等于检测网格的间距），每轴 21 个箱（索引 = round(位移 / 1.625) + 10，箱中心覆盖 ±16.25 µm，
+#   15 µm 半径内的位移总在范围内）；再对众数箱及其 ±1 邻箱（3×3×3）内的向量逐轴取中位数，得到比箱宽更细的估计。
+#   任一帧少于 20 个点、或位移向量少于 50 条时样本太少，不做估计（返回 None）。
+def _relink_global_shift(source_arr: np.ndarray, target_arr: np.ndarray) -> np.ndarray | None:
+    """估计两帧之间的整体平移，返回 µm 向量 (z, y, x)；样本太少或估计失败时返回 None。"""
+    if len(source_arr) < 20 or len(target_arr) < 20:
+        return None
+    pairs = cKDTree(target_arr).query_ball_point(source_arr, r=15.0)
+    chunks = [target_arr[near] - source_arr[i] for i, near in enumerate(pairs) if len(near)]
+    if not chunks:
+        return None
+    disp = np.concatenate(chunks)
+    if len(disp) < 50:
+        return None
+    bins = np.round(disp / 1.625).astype(int) + 10
+    inside = ((bins >= 0) & (bins <= 20)).all(axis=1)
+    bins = bins[inside]
+    disp = disp[inside]
+    hist = np.zeros((21, 21, 21))
+    np.add.at(hist, (bins[:, 0], bins[:, 1], bins[:, 2]), 1)
+    mode = np.array(np.unravel_index(np.argmax(hist), hist.shape))
+    around = (np.abs(bins - mode) <= 1).all(axis=1)
+    if not around.any():
+        return None
+    shift = np.median(disp[around], axis=0)
+    return shift if np.isfinite(shift).all() else None
+
+
+# ---- flow 重链接 ----
+# 抛开 ILP 选的边，对每个帧对 t → t+1 重新做一对一匹配；返回的边会替换全部 ILP 边（见 filter_output_graph），
+#   ILP 实际上只决定了保留哪些节点（只有重链接一条边都没给出时，才退回 ILP 的边）。
+# 代价 = ‖目标位置 − 预测位置‖ − LEARNED_BONUS × p：先预测每个细胞下一帧在哪里，候选离预测位置越近越好；
+#   p 是模型给这一对的连接概率，LEARNED_BONUS 由第 0 段设为 1.0（代码缺省 0.75），即模型概率最多抵 1 µm 的残差，
+#   在几何上差不多的候选之间偏向模型更有把握的那个。
+#   第一遍只有 ILP 选中的边带 p，其余配对按 0 计；最终一遍还并入稠密候选缓存里的概率（候选概率重链接：
+#   10 µm 内或每个目标 top-12 的全部候选对都有 p，用的是关联特征修正版本的概率；同一配对上缓存值覆盖 ILP 边原来的 p）。
+# 每个帧对用匈牙利算法求总代价最小的一对一分配：每个细胞最多一父一子，没有贪心匹配“先到先得”的抢配问题。
+#   分裂（一父两子）留给后面的安全分裂与分裂补全打分器。
+# 原理：指标的主体是边 Jaccard，关联连对多少直接决定分数；而在训练影像上实测，漏掉的边里约一半是
+#   “两端节点都在、只是没连对”，所以在关联这一层重做匹配收益很大。
+# 注：本段后半部分安装分裂补全打分器时，会把本函数包一层，只为记下 learned_edge_probs 供打分器作特征，返回值不变。
+def motion_relink_edges(
+    nodes_by_id: dict[int, dict[str, object]],
+    stats: dict[str, int],
+    learned_edge_probs: dict[tuple[int, int], float] | None = None,
+) -> list[dict[str, object]]:
+    if not OUTPUT_MOTION_RELINK or not nodes_by_id:
+        return []
+
+    learned_edge_probs = learned_edge_probs or {}
+
+    # 取 (源, 目标) 对的模型概率，没有记录的对按 0 计；数值超出 [0, 1] 时视为 logit，先过 sigmoid
+    #   （输入截断在 ±20 防止溢出），保证奖励项有界。
+    def learned_prob(source_id: int, target_id: int) -> float:
+        value = learned_edge_probs.get((source_id, target_id), 0.0)
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not np.isfinite(value):
+            return 0.0
+        if value < 0.0 or value > 1.0:
+            value = 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, value))))
+        return float(np.clip(value, 0.0, 1.0))
+
+    # 按帧分组，组内按 id 排序，保证代价矩阵的行列顺序固定、结果可复现。
+    ids_by_t: dict[int, list[int]] = {}
+    for node_id, node in nodes_by_id.items():
+        ids_by_t.setdefault(int(node["t"]), []).append(node_id)
+    for ids in ids_by_t.values():
+        ids.sort()
+
+    # 任何一帧的节点数超过 MOTION_RELINK_MAX_FRAME_NODES（2600）就整段影像跳过重链接、保留 ILP 边：
+    #   匈牙利算法的耗时大约随节点数立方增长，超大帧会拖垮运行时限。
+    frame_sizes = [len(ids) for ids in ids_by_t.values()]
+    if frame_sizes and max(frame_sizes) > MOTION_RELINK_MAX_FRAME_NODES:
+        stats["motion_relink_skipped_large_frame"] = 1
+        return []
+
+    # position_um：每个节点的 µm 坐标；predecessor_position_um：目标节点被链接后记下其父节点的位置，
+    #   供下一帧对在没有位移场时按“上一步速度”外推。
+    position_um = {node_id: _position_um(node) for node_id, node in nodes_by_id.items()}
+    predecessor_position_um: dict[int, np.ndarray] = {}
+    selected_edges: list[dict[str, object]] = []
+
+    # 邻域位移场（flow 场）：用一批可信匹配的（源位置, 位移）建 KD 树。预测某个源点的位移时，取 40 µm
+    #   （FLOW_RADIUS_UM，第 0 段）内最近的 12 个（FLOW_K）样本，对它们的位移逐轴取中位数——中位数不怕少数错误匹配。
+    #   exclude_um 排除与源点几乎重合的样本（下面用 1.5 µm，排除的就是它自己的种子匹配），防止一个错误的种子
+    #   给自己投票；为此查询时多取 1 个（FLOW_K + 1）。样本少于 4 个（FLOW_MIN_SAMPLES）时不建场。
+    def _flow_predictor(flow_src, flow_disp):
+        """返回 flow 预测函数：对一个源点，取最近若干个样本位移的逐轴中位数；样本不足时返回 None。
+
+        细胞随邻居一起移动，所以从可信匹配中采样得到的位移场，比细胞自己上一步的速度更能预测它的下一位置。
+        """
+        if len(flow_src) < MOTION_RELINK_FLOW_MIN_SAMPLES:
+            return None
+        flow_src = np.asarray(flow_src, dtype=np.float64)
+        flow_disp = np.asarray(flow_disp, dtype=np.float64)
+        tree = cKDTree(flow_src)
+        k_query = min(MOTION_RELINK_FLOW_K + 1, len(flow_src))
+
+        def predict(source_pos, exclude_um):
+            dist, idx = tree.query(source_pos, k=k_query, distance_upper_bound=MOTION_RELINK_FLOW_RADIUS_UM)
+            dist = np.atleast_1d(dist)
+            idx = np.atleast_1d(idx)
+            keep = np.isfinite(dist) & (dist >= exclude_um)
+            idx = idx[keep][:MOTION_RELINK_FLOW_K]
+            if idx.size == 0:
+                return None
+            return np.median(flow_disp[idx], axis=0)
+
+        return predict
+
+    # 运动残差可以在 z 方向单独加权（原始距离从不加权）。第 0 段设 FLOW_Z_WEIGHT = 1.0，即各向同性，
+    #   flow_anisotropic 为 False，下面的各向异性分支都不执行。
+    flow_weight = np.array([MOTION_RELINK_FLOW_Z_WEIGHT, 1.0, 1.0], dtype=np.float64)
+    flow_anisotropic = MOTION_RELINK_FLOW_Z_WEIGHT != 1.0
+
+    # 一次带门限的匈牙利分配。每个源点的预测位置依次取：
+    #   ① 位移场能给出预测（40 µm 内有样本）→ 源位置 + 场预测的位移；
+    #   ② 否则，若有父节点 → 源位置 + VELOCITY_WEIGHT（0.5）×（源位置 − 父节点位置），即按上一步速度的一半外推；
+    #   ③ 都没有 → 源位置本身。
+    # 准入：原始距离 ≤ 门限；有位移场时（FLOW_GATE，第 0 段打开），目标离“预测位置” ≤ 门限也准入。
+    # 代价 = 运动残差 + FLOW_RAW_COST × 原始距离 − LEARNED_BONUS × p；第 0 段把 FLOW_RAW_COST 设为 0（代码缺省 0.05），
+    #   所以实际是“运动残差 − p”。不准入的配对代价设为 big（门限 × 1000 + 1），求解后丢弃。
+    # 返回 (源, 目标, 原始距离, 运动残差, p) 的列表。
+    def assign_pass(
+        source_ids: list[int],
+        target_ids: list[int],
+        gate_um: float,
+        flow=None,
+        flow_exclude_um: float = 0.0,
+    ) -> list[tuple[int, int, float, float, float]]:
+        if not source_ids or not target_ids:
+            return []
+        big = gate_um * 1000.0 + 1.0
+        cost = np.full((len(source_ids), len(target_ids)), big, dtype=np.float64)
+        raw_dist = np.full_like(cost, np.inf)
+        motion_dist = np.full_like(cost, np.inf)
+        prob_matrix = np.zeros_like(cost)
+        target_arr = np.stack([position_um[target_id] for target_id in target_ids])
+        source_arr = np.stack([position_um[source_id] for source_id in source_ids])
+        predicted_arr = np.empty_like(source_arr)
+        flow_hit = np.zeros(len(source_ids), dtype=bool)
+        for i, source_id in enumerate(source_ids):
+            source_pos = position_um[source_id]
+            prev_pos = predecessor_position_um.get(source_id)
+            flow_step = flow(source_pos, flow_exclude_um) if flow is not None else None
+            if flow_step is not None:
+                predicted_arr[i] = source_pos + flow_step
+                flow_hit[i] = True
+                stats["motion_relink_flow_predicted"] = stats.get("motion_relink_flow_predicted", 0) + 1
+            elif prev_pos is None:
+                predicted_arr[i] = source_pos
+            else:
+                predicted_arr[i] = source_pos + MOTION_RELINK_VELOCITY_WEIGHT * (source_pos - prev_pos)
+        target_tree = cKDTree(target_arr)
+        gate_radius = gate_um * (1.0 + 1e-9) + 1e-9
+        gate_neighbours = target_tree.query_ball_point(source_arr, r=gate_radius)
+        # 有位移场时，目标落在“预测位置”的门限内也准入：一个随邻居移动 8 µm 的细胞因此能在紧门限轮次里参与竞争，
+        #   而不必等到宽门限轮次——那时它的目标可能已被慢细胞占走。
+        # RAW_ADMIT 关闭时，这是有场预测的源点唯一的准入方式；没有场样本的源点仍按原始距离准入。
+        #   第 0 段 RAW_ADMIT = 1，两种准入并存（下面 raw_admits 恒为 True）。
+        flow_gated = flow is not None and MOTION_RELINK_FLOW_GATE
+        if flow_gated:
+            predicted_radius = gate_radius / MOTION_RELINK_FLOW_Z_WEIGHT if flow_anisotropic else gate_radius
+            around_predicted = target_tree.query_ball_point(predicted_arr, r=predicted_radius)
+            gate_neighbours = [
+                sorted(set(near_source) | set(near_predicted))
+                for near_source, near_predicted in zip(gate_neighbours, around_predicted)
+            ]
+        for i, source_id in enumerate(source_ids):
+            source_pos = position_um[source_id]
+            predicted = predicted_arr[i]
+            raw_admits = MOTION_RELINK_FLOW_RAW_ADMIT or not (flow_gated and flow_hit[i])
+            for j in sorted(gate_neighbours[i]):
+                target_id = target_ids[j]
+                target_pos = position_um[target_id]
+                raw = float(np.linalg.norm(target_pos - source_pos))
+                if flow_anisotropic:
+                    motion = float(np.linalg.norm((target_pos - predicted) * flow_weight))
+                else:
+                    motion = float(np.linalg.norm(target_pos - predicted))
+                if not ((raw_admits and raw <= gate_um) or (flow_gated and motion <= gate_um)):
+                    continue
+                prob = learned_prob(source_id, target_id)
+                raw_dist[i, j] = raw
+                motion_dist[i, j] = motion
+                prob_matrix[i, j] = prob
+                cost[i, j] = motion + MOTION_RELINK_FLOW_RAW_COST * raw - MOTION_RELINK_LEARNED_BONUS * prob
+        row_ind, col_ind = linear_sum_assignment(cost)
+        matches: list[tuple[int, int, float, float, float]] = []
+        for r, c in zip(row_ind, col_ind):
+            if cost[r, c] >= big:
+                continue
+            matches.append((
+                source_ids[int(r)],
+                target_ids[int(c)],
+                float(raw_dist[r, c]),
+                float(motion_dist[r, c]),
+                float(prob_matrix[r, c]),
+            ))
+        return matches
+
+    # 用一批匹配建位移场：样本位置 = 源位置，样本位移 = 目标位置 − 源位置。
+    def _field_from(matches):
+        return _flow_predictor(
+            [position_um[m[0]] for m in matches],
+            [position_um[m[1]] - position_um[m[0]] for m in matches],
+        )
+
+    # 门限（µm）：
+    #   种子轮：FLOW_SEED_GATE_UM = 0 → 退回 MOTION_RELINK_TIGHT_UM，第 0 段设为 5.5（代码缺省 6.0）；
+    #   有位移场时的正式分配：先紧门限 FLOW_TIGHT_UM = 7.0，再宽门限（FLOW_RELAXED_UM = 0 → 退回 RELAXED_UM = 10.0）；
+    #   没有位移场时：先 5.5、再 10.0。
+    # 先紧后宽：先锁定把握大的近距离匹配，剩下的点再放宽条件，避免宽门限下的错误配对挤掉近处的正确配对。
+    seed_gate_um = MOTION_RELINK_FLOW_SEED_GATE_UM if MOTION_RELINK_FLOW_SEED_GATE_UM > 0 else MOTION_RELINK_TIGHT_UM
+    flow_tight_um = MOTION_RELINK_FLOW_TIGHT_UM if MOTION_RELINK_FLOW_TIGHT_UM > 0 else MOTION_RELINK_TIGHT_UM
+    flow_relaxed_um = MOTION_RELINK_FLOW_RELAXED_UM if MOTION_RELINK_FLOW_RELAXED_UM > 0 else MOTION_RELINK_RELAXED_UM
+
+    # 逐帧对处理 t → t+1。FLOW_MODE 由第 0 段设为 "seed"：
+    #   ① 种子轮：用“上一帧对全部匹配建出的位移场”做一次 5.5 µm 的紧匹配（第一个帧对还没有场，用速度外推或原地）；
+    #   ② 用这批种子匹配建出本帧对自己的位移场；
+    #   ③ 所有源点对着这个新场重新分配（先紧后宽两轮）。
+    # 这样位移场总是来自当前帧对，能跟上运动速度的变化。（"prev" 模式直接用上一帧对的场，本配置不用。）
+    times = sorted(ids_by_t)
+    previous_flow = None
+    for t in times:
+        source_ids = ids_by_t.get(t, [])
+        target_ids = ids_by_t.get(t + 1, [])
+        if not source_ids or not target_ids:
+            continue
+        flow = None
+        flow_exclude_um = 0.0
+        if MOTION_RELINK_FLOW_MODE == "prev":
+            flow = previous_flow
+        elif MOTION_RELINK_FLOW_MODE == "seed":
+            # 先做把握大的紧门限种子匹配，再让所有源点对着这些种子定义的位移场重新分配；查询位移场时排除源点自己的种子匹配
+            #   （exclude 1.5 µm），一个错误的种子不能给自己投票。
+            seed_flow = previous_flow
+            if _G1X1_ACTIVE and MOTION_RELINK_GLOBAL_SEED_MIN_UM > 0:
+                # 全局位移估计的接入点：上一帧对的位移场预料不到整帧跳变，用它做种子会整体配错，由种子建出的场也跟着错。
+                #   所以先估计本帧对的整体平移，若 ≥ 3 µm，种子轮改用“所有源点都加同一个平移向量”来预测位置
+                #   （下面的 lambda 对任何源点都返回同一个 shift）；之后的位移场照常由这批种子匹配重新建立。
+                #   估计出错时计数并退回原行为，不影响输出的合法性。
+                stats.setdefault("motion_relink_global_seed_frames", 0)
+                try:
+                    global_shift = _relink_global_shift(
+                        np.stack([position_um[node_id] for node_id in source_ids]),
+                        np.stack([position_um[node_id] for node_id in target_ids]),
+                    )
+                except Exception:
+                    global_shift = None
+                    stats["motion_relink_global_seed_errors"] = stats.get("motion_relink_global_seed_errors", 0) + 1
+                if global_shift is not None and float(np.linalg.norm(global_shift)) >= MOTION_RELINK_GLOBAL_SEED_MIN_UM:
+                    seed_flow = lambda _source_pos, _exclude_um, _shift=global_shift: _shift
+                    stats["motion_relink_global_seed_frames"] += 1
+            seed = assign_pass(source_ids, target_ids, seed_gate_um, seed_flow)
+            flow = _field_from(seed)
+            flow_exclude_um = MOTION_RELINK_FLOW_EXCLUDE_UM
+            if flow is not None:
+                stats["motion_relink_flow_frames"] = stats.get("motion_relink_flow_frames", 0) + 1
+        # FLOW_ITER = 1（第 0 段）：只做一轮正式分配，下面 round_index > 0 的“用上一轮结果再建场”细化分支不执行。
+        rounds = MOTION_RELINK_FLOW_ITER if MOTION_RELINK_FLOW_MODE != "off" else 1
+        frame_matches: list[tuple[int, int, float, float, str, float]] = []
+        for round_index in range(max(1, rounds)):
+            if round_index > 0:
+                # 细化：用上一轮的最终匹配重新建场，再让所有源点对着它重新分配。
+                refined = _field_from([(s, g) for s, g, _r, _m, _n, _p in frame_matches])
+                if refined is None:
+                    break
+                flow = refined
+                flow_exclude_um = MOTION_RELINK_FLOW_EXCLUDE_UM
+            # 先紧后宽两轮：每轮只在尚未匹配的源点与目标上做匈牙利分配。
+            unmatched_sources = set(source_ids)
+            unmatched_targets = set(target_ids)
+            frame_matches = []
+            passes = (("tight", flow_tight_um), ("relaxed", flow_relaxed_um)) if flow is not None else (
+                ("tight", MOTION_RELINK_TIGHT_UM), ("relaxed", MOTION_RELINK_RELAXED_UM))
+            for pass_name, gate_um in passes:
+                pass_sources = [node_id for node_id in source_ids if node_id in unmatched_sources]
+                pass_targets = [node_id for node_id in target_ids if node_id in unmatched_targets]
+                matches = assign_pass(pass_sources, pass_targets, gate_um, flow, flow_exclude_um)
+                for source_id, target_id, raw, motion, prob in matches:
+                    if source_id not in unmatched_sources or target_id not in unmatched_targets:
+                        continue
+                    unmatched_sources.remove(source_id)
+                    unmatched_targets.remove(target_id)
+                    frame_matches.append((source_id, target_id, raw, motion, pass_name, prob))
+        # 记录本帧对的匹配：边上保存模型概率、原始距离、运动残差与所属轮次；把源位置记为目标的“父节点位置”，
+        #   供下一帧对的速度外推使用；本帧对的全部匹配再建成位移场，作为下一帧对种子轮的先验。
+        for source_id, target_id, raw, motion, pass_name, prob in frame_matches:
+            if pass_name == "tight":
+                stats["motion_relink_tight_edges"] += 1
+            else:
+                stats["motion_relink_relaxed_edges"] += 1
+            selected_edges.append({
+                "source_id": source_id,
+                "target_id": target_id,
+                "edge_prob": prob,
+                "distance_um": raw,
+                "motion_distance_um": motion,
+                "motion_relinked": 1,
+                "motion_pass": pass_name,
+            })
+            predecessor_position_um[target_id] = position_um[source_id]
+        if MOTION_RELINK_FLOW_MODE != "off":
+            previous_flow = _field_from([(s, g) for s, g, _r, _m, _n, _p in frame_matches])
+        stats["motion_relink_frames"] += 1
+
+    stats["motion_relink_edges"] = len(selected_edges)
+    return selected_edges
+
+# ---- 单帧缺口闭合 ----
+# 检测器在某一帧漏掉一个细胞时，轨迹在 t 帧结束、t+2 帧重新开始：丢了两条正确的边，两段轨迹还可能因为太短在后面的
+#   “删除短轨迹”中被删掉。这里把 t 帧的轨迹末端（无出边）与 t+2 帧的轨迹起点（无入边）配对，在 t+1 帧补一个中间节点，
+#   把两段接起来：一次找回两条边，也保住了轨迹长度。
+# 配对：门限 GAP_CLOSE_UM × (缺口 + 1) = 5.0 × 2 = 10 µm（第 0 段设 GAP_CLOSE_UM = 5.0），密度自适应微调后，
+#   用匈牙利算法求一对一最优匹配。
+# 中间节点：优先复用 t+1 帧上离插值中点 ≤ 3.2 µm 的孤立检测（真实检测比插值可信）；否则新建合成节点并做亮度质心精修，
+#   跨度大的合成节点还要通过 DeepCenter 确认。
+# GAP_CLOSE_MAX_GAP 在第 0 段设为 2，但代码只处理 1 帧缺口（effective_gap_max = min(…, 1)）；
+#   两帧缺口由后面的 recover_strict_gap2 单独处理。
+def close_single_frame_gaps(
+    nodes_by_id: dict[int, dict[str, object]],
+    edges: list[dict[str, object]],
+    stats: dict[str, int],
+    dataset: str | None = None,
+    deepcenter_bundle: dict[str, object] | None = None,
+    frame_cache: dict[int, np.ndarray] | None = None,
+    deepcenter_cache: dict[tuple[str, int], np.ndarray] | None = None,
+) -> tuple[dict[int, dict[str, object]], list[dict[str, object]]]:
+    if not OUTPUT_GAP_CLOSE or GAP_CLOSE_MAX_GAP < 1 or not edges:
+        return nodes_by_id, edges
+
+    # 按帧收集：轨迹末端 = 没有出边的节点，轨迹起点 = 没有入边的节点，孤立节点 = 没有任何边（它同时也是末端和起点）。
+    outgoing = {int(edge["source_id"]) for edge in edges}
+    incoming = {int(edge["target_id"]) for edge in edges}
+    incident = outgoing | incoming
+
+    ends_by_t: dict[int, list[int]] = {}
+    starts_by_t: dict[int, list[int]] = {}
+    isolated_by_t: dict[int, list[int]] = {}
+    all_ids_by_t: dict[int, list[int]] = {}
+    for node_id, node in nodes_by_id.items():
+        t = int(node["t"])
+        all_ids_by_t.setdefault(t, []).append(node_id)
+        if node_id not in outgoing:
+            ends_by_t.setdefault(t, []).append(node_id)
+        if node_id not in incoming:
+            starts_by_t.setdefault(t, []).append(node_id)
+        if node_id not in incident:
+            isolated_by_t.setdefault(t, []).append(node_id)
+
+    # 合成节点预算：min(2000, 节点数 × 5%)。节点数调整项会惩罚多报节点，新增节点必须有上限。
+    max_synthetic = min(
+        GAP_CLOSE_MAX_ADDED_ABS,
+        max(1, int(round(len(nodes_by_id) * GAP_CLOSE_MAX_ADDED_FRAC))) if GAP_CLOSE_MAX_ADDED_FRAC > 0 else 0,
+    )
+    next_id = _next_node_id(nodes_by_id)
+    frame_cache = frame_cache if frame_cache is not None else {}
+    deepcenter_cache = deepcenter_cache if deepcenter_cache is not None else {}
+    used_starts: set[int] = set()
+    used_isolated: set[int] = set()
+    synthetic_added = 0
+    new_edges: list[dict[str, object]] = []
+
+    # 局部间距：每个节点到同帧最近 3 个邻居（GAP_DENSITY_NEIGHBORS）距离的中位数，按帧缓存；只有 1 个节点的帧用
+    #   参考值 6.5 µm（GAP_DENSITY_REFERENCE_UM）。稀疏区细胞间距大，门限可以略宽；密集区邻居近，门限略收紧，
+    #   减少接到相邻细胞上。
+    density_cache: dict[int, dict[int, float]] = {}
+
+    def frame_local_spacing(t: int) -> dict[int, float]:
+        cached = density_cache.get(t)
+        if cached is not None:
+            return cached
+
+        frame_ids = all_ids_by_t.get(t, [])
+        if len(frame_ids) <= 1:
+            result = {
+                node_id: GAP_DENSITY_REFERENCE_UM
+                for node_id in frame_ids
+            }
+            density_cache[t] = result
+            return result
+
+        positions = np.stack(
+            [_position_um(nodes_by_id[node_id]) for node_id in frame_ids]
+        )
+        tree = cKDTree(positions)
+        query_k = min(
+            len(frame_ids),
+            max(2, GAP_DENSITY_NEIGHBORS + 1),
+        )
+        distances, _ = tree.query(positions, k=query_k)
+        if distances.ndim == 1:
+            distances = distances[:, None]
+
+        result: dict[int, float] = {}
+        for idx, node_id in enumerate(frame_ids):
+            neighbour_distances = distances[idx, 1:]
+            neighbour_distances = neighbour_distances[
+                np.isfinite(neighbour_distances)
+            ]
+            spacing = (
+                float(np.median(neighbour_distances))
+                if neighbour_distances.size
+                else GAP_DENSITY_REFERENCE_UM
+            )
+            result[node_id] = spacing
+
+        density_cache[t] = result
+        stats["gap_density_nodes_scored"] += len(result)
+        return result
+
+    # 实际只处理 1 帧缺口：t 帧末端 → t+2 帧起点，中间帧 t+1。
+    effective_gap_max = min(GAP_CLOSE_MAX_GAP, 1)
+    stats["gap_close_effective_max_gap"] = effective_gap_max
+    for gap in range(1, effective_gap_max + 1):
+        for t, end_ids in sorted(ends_by_t.items()):
+            start_ids = [sid for sid in starts_by_t.get(t + gap + 1, []) if sid not in used_starts]
+            if not end_ids or not start_ids:
+                continue
+
+            end_points = [node_point(nodes_by_id[eid]) for eid in end_ids]
+            start_points = [node_point(nodes_by_id[sid]) for sid in start_ids]
+            # 基础门限 = GAP_CLOSE_UM × (gap + 1) = 10 µm：两端相隔两步，每步最多约 5 µm。
+            threshold_um = GAP_CLOSE_UM * (gap + 1)
+            d = np.zeros(
+                (len(end_ids), len(start_ids)),
+                dtype=np.float64,
+            )
+            adaptive_threshold = np.full_like(d, threshold_um)
+
+            source_spacing = frame_local_spacing(t)
+            target_spacing = frame_local_spacing(t + gap + 1)
+
+            for i, ep in enumerate(end_points):
+                for j, sp in enumerate(start_points):
+                    d[i, j] = point_distance_um(ep, sp)
+
+                    # 密度自适应（第 0 段打开）：每步门限增量 = clip(0.040 × (两端局部间距的均值 − 6.5 µm), ±0.125 µm)，
+                    #   两步合计最多 ±0.25 µm，只是对 10 µm 门限的微调。
+                    if GAP_DENSITY_ADAPTIVE:
+                        local_spacing = 0.5 * (
+                            source_spacing.get(
+                                end_ids[i],
+                                GAP_DENSITY_REFERENCE_UM,
+                            )
+                            + target_spacing.get(
+                                start_ids[j],
+                                GAP_DENSITY_REFERENCE_UM,
+                            )
+                        )
+                        step_delta = float(
+                            np.clip(
+                                GAP_DENSITY_GAIN
+                                * (
+                                    local_spacing
+                                    - GAP_DENSITY_REFERENCE_UM
+                                ),
+                                -GAP_DENSITY_MAX_STEP_DELTA_UM,
+                                GAP_DENSITY_MAX_STEP_DELTA_UM,
+                            )
+                        )
+                        adaptive_threshold[i, j] = (
+                            threshold_um + step_delta * (gap + 1)
+                        )
+                        stats[
+                            "gap_density_step_delta_milli_sum"
+                        ] += int(round(1000.0 * step_delta))
+
+            base_allowed = d <= threshold_um
+            adaptive_allowed = d <= adaptive_threshold
+
+            stats["gap_density_candidates_expanded"] += int(
+                (adaptive_allowed & ~base_allowed).sum()
+            )
+            stats["gap_density_candidates_restricted"] += int(
+                (base_allowed & ~adaptive_allowed).sum()
+            )
+            stats["gap_candidates"] += int(adaptive_allowed.sum())
+
+            if not np.isfinite(d).any():
+                continue
+
+            # 匈牙利算法：门限外的配对代价设为 big，求解后跳过；每个末端最多接一个起点。
+            max_threshold = float(np.max(adaptive_threshold))
+            big = max_threshold * 1000.0 + 1.0
+            cost = np.where(adaptive_allowed, d, big)
+            row_ind, col_ind = linear_sum_assignment(cost)
+
+            for r, c in zip(row_ind, col_ind):
+                if not adaptive_allowed[r, c]:
+                    continue
+                if not base_allowed[r, c]:
+                    stats[
+                        "gap_density_selected_outside_base"
+                    ] += 1
+                source_id = end_ids[int(r)]
+                target_id = start_ids[int(c)]
+                # 已经有出边的末端（例如在前一帧的处理中被复用作中间节点的孤立检测）和已用过的起点跳过。
+                if source_id in outgoing or target_id in used_starts:
+                    continue
+
+                source = nodes_by_id[source_id]
+                target = nodes_by_id[target_id]
+                mid_t = int(source["t"]) + gap
+                mid_point = (
+                    (float(source["z"]) + float(target["z"])) / 2.0,
+                    (float(source["y"]) + float(target["y"])) / 2.0,
+                    (float(source["x"]) + float(target["x"])) / 2.0,
+                )
+
+                # 中间节点优先复用：t+1 帧上尚未被用过的孤立检测中，离插值中点最近且 ≤ GAP_CLOSE_REUSE_UM（3.2 µm）的那个。
+                #   真实检测比插值点可信，而且不增加节点数。
+                middle_id: int | None = None
+                middle_reused = False
+                if GAP_CLOSE_REUSE_EXISTING:
+                    candidates = [nid for nid in isolated_by_t.get(mid_t, []) if nid not in used_isolated]
+                    if candidates:
+                        distances = [point_distance_um(node_point(nodes_by_id[nid]), mid_point) for nid in candidates]
+                        best_idx = int(np.argmin(distances))
+                        if distances[best_idx] <= GAP_CLOSE_REUSE_UM:
+                            middle_id = candidates[best_idx]
+                            middle_reused = True
+
+                # 没有可复用的检测：预算未用完时新建合成节点（标记 gap_synthetic = 1），位置用亮度质心精修。
+                if middle_id is None:
+                    if synthetic_added >= max_synthetic:
+                        stats["gap_skipped_node_cap"] += 1
+                        continue
+                    middle_id = next_id
+                    next_id += 1
+                    refined_point = refine_synthetic_midpoint(dataset, mid_t, mid_point, frame_cache, stats)
+                    nodes_by_id[middle_id] = {
+                        "node_id": middle_id,
+                        "t": mid_t,
+                        "z": refined_point[0],
+                        "y": refined_point[1],
+                        "x": refined_point[2],
+                        "gap_synthetic": 1,
+                    }
+                    synthetic_added += 1
+                    stats["gap_inserted_synthetic"] += 1
+
+                # DeepCenter 确认：只有“合成的”中间节点、且两端跨度 ≥ 8.5 µm（DEEPCENTER_GAP_CONFIRM_MIN_SPAN_UM，第 0 段）时才需要。
+                #   跨度小时两端离得近，插值点几乎必然落在同一个细胞上；跨度大时插值点更可能落在两个细胞之间的空隙里
+                #   （或两端本是两个不同的细胞），所以要求中心先验分数
+                #   ≥ 0.25，不通过就撤销这个合成节点（预算退回）并放弃这次闭合。复用的真实检测不需要确认。
+                # 注意统计键名：deepcenter_gap_bypassed_strong_motion 实际统计的是“跨度 < 8.5 µm 而免检”的次数。
+                middle = nodes_by_id[middle_id]
+                gap_span_um = float(d[r, c])
+                marginal_gap = gap_span_um >= DEEPCENTER_GAP_CONFIRM_MIN_SPAN_UM
+                synthetic_middle = int(middle.get("gap_synthetic", 0)) == 1
+                requires_center_confirmation = (
+                    DEEPCENTER_GAP_VETO and marginal_gap and synthetic_middle
+                )
+                if DEEPCENTER_GAP_VETO and not marginal_gap:
+                    stats["deepcenter_gap_bypassed_strong_motion"] += 1
+                elif DEEPCENTER_GAP_VETO and not synthetic_middle:
+                    stats["deepcenter_gap_bypassed_observed_node"] += 1
+                if requires_center_confirmation and not deepcenter_accept_repair_point(
+                    dataset,
+                    mid_t,
+                    node_point(middle),
+                    deepcenter_bundle,
+                    frame_cache,
+                    deepcenter_cache,
+                    stats,
+                    "gap",
+                    DEEPCENTER_GAP_THRESHOLD,
+                ):
+                    if int(middle.get("gap_synthetic", 0)) == 1:
+                        nodes_by_id.pop(middle_id, None)
+                        synthetic_added = max(0, synthetic_added - 1)
+                        stats["gap_inserted_synthetic"] = max(0, stats["gap_inserted_synthetic"] - 1)
+                    continue
+                if middle_reused:
+                    used_isolated.add(middle_id)
+                    stats["gap_reused_existing"] += 1
+
+                # 加两条边：末端 → 中间节点 → 起点。它们没有模型概率（edge_prob = None），标记 gap_closed = 1。
+                e1 = {
+                    "source_id": source_id,
+                    "target_id": middle_id,
+                    "edge_prob": None,
+                    "distance_um": edge_distance_um(source, middle),
+                    "gap_closed": 1,
+                }
+                e2 = {
+                    "source_id": middle_id,
+                    "target_id": target_id,
+                    "edge_prob": None,
+                    "distance_um": edge_distance_um(middle, target),
+                    "gap_closed": 1,
+                }
+                new_edges.extend([e1, e2])
+                outgoing.add(source_id)
+                incoming.add(middle_id)
+                outgoing.add(middle_id)
+                incoming.add(target_id)
+                used_starts.add(target_id)
+                stats["gap_pairs_selected"] += 1
+                stats["gap_added_edges"] += 2
+
+    if new_edges:
+        edges = [*edges, *new_edges]
+    stats["gap_added_nodes"] = stats["gap_inserted_synthetic"]
+    return nodes_by_id, edges
+
+
+# ---- 严格两帧缺口 ----
+# 辅助映射：只记录恰好有一个后继 / 一个前驱的节点（分叉处没有唯一的运动方向）。
+def _single_successor_map(edges: list[dict[str, object]]) -> dict[int, int]:
+    by_source: dict[int, list[int]] = {}
+    for edge in edges:
+        by_source.setdefault(int(edge["source_id"]), []).append(int(edge["target_id"]))
+    return {source: targets[0] for source, targets in by_source.items() if len(targets) == 1}
+
+
+def _single_predecessor_map(edges: list[dict[str, object]]) -> dict[int, int]:
+    by_target: dict[int, list[int]] = {}
+    for edge in edges:
+        by_target.setdefault(int(edge["target_id"]), []).append(int(edge["source_id"]))
+    return {target: sources[0] for target, sources in by_target.items() if len(sources) == 1}
+
+
+# 连续两帧漏检时，把 t 帧的轨迹末端接到 t+3 帧的轨迹起点，在 1/3、2/3 处插入两个插值节点（t+1、t+2 帧，各自做亮度
+#   质心精修）。跨度更长、更容易接错，所以条件比单帧更严（第 0 段打开 OUTPUT_GAP2_RECOVERY，代码缺省关闭）：
+#   ① 总距离 ≤ GAP2_MAX_TOTAL_UM（10.2 µm）；另一条“平均每步 ≤ GAP2_MAX_STEP_UM（4.4 µm）”相当于总距离 ≤ 13.2 µm，
+#      比前一条宽，在当前参数下不起作用；
+#   ② 运动方向一致（GAP2_REQUIRE_CONTEXT）：细胞的运动在短时间内近似惯性，所以末端的上一步、或起点的下一步，至少有
+#      一个要与插值步方向不明显相反（余弦 > −0.25，即夹角小于约 104°）且两步的向量差 ≤ 6 µm（任一步长几乎为 0 时
+#      直接算一致）；两侧都没有可比的
+#      步时不接；
+#   ③ 按“总距离 + 2 × 方向罚项”从小到大贪心选取（不是匈牙利），每个端点只用一次；全局上限
+#      min(180, 边数 × 0.45%)，每帧上限 max(1, 该帧末端数 × 0.6%)，宁缺毋滥。
+# 新插入的节点不带 gap_synthetic 标记、不经过 DeepCenter 确认；新边标记 gap2_recovered = 1，没有模型概率。
+def recover_strict_gap2(
+    nodes_by_id: dict[int, dict[str, object]],
+    edges: list[dict[str, object]],
+    stats: dict[str, int],
+    dataset: str | None = None,
+) -> tuple[dict[int, dict[str, object]], list[dict[str, object]]]:
+    if not OUTPUT_GAP2_RECOVERY or not edges or not nodes_by_id:
+        return nodes_by_id, edges
+
+    outgoing = {int(edge["source_id"]) for edge in edges}
+    incoming = {int(edge["target_id"]) for edge in edges}
+    predecessor = _single_predecessor_map(edges)
+    successor = _single_successor_map(edges)
+
+    ends_by_t: dict[int, list[int]] = {}
+    starts_by_t: dict[int, list[int]] = {}
+    for node_id, node in nodes_by_id.items():
+        t = int(node["t"])
+        if node_id not in outgoing:
+            ends_by_t.setdefault(t, []).append(node_id)
+        if node_id not in incoming:
+            starts_by_t.setdefault(t, []).append(node_id)
+
+    cap = min(GAP2_MAX_LINKS_ABS, max(1, int(round(len(edges) * GAP2_MAX_LINKS_FRAC))))
+    proposals: list[tuple[float, int, int, int, float]] = []
+
+    def pos_um(node_id: int) -> np.ndarray:
+        node = nodes_by_id[node_id]
+        return np.array([float(node["z"]), float(node["y"]), float(node["x"])], dtype=np.float64) * np.array(VOXEL_SCALE_UM)
+
+    for t, end_ids in sorted(ends_by_t.items()):
+        start_ids = starts_by_t.get(t + 3, [])
+        if not end_ids or not start_ids:
+            continue
+        for end_id in end_ids:
+            end_pos = pos_um(end_id)
+            for start_id in start_ids:
+                start_pos = pos_um(start_id)
+                dist = float(np.linalg.norm(start_pos - end_pos))
+                if dist > GAP2_MAX_TOTAL_UM or dist / 3.0 > GAP2_MAX_STEP_UM:
+                    continue
+                step = (start_pos - end_pos) / 3.0
+                context_penalty = 0.0
+                # 方向罚项 = Σ max(0, 0.25 − cos)：方向越不一致罚得越多，用于排序。
+                if GAP2_REQUIRE_CONTEXT:
+                    ok_context = False
+                    prev_id = predecessor.get(end_id)
+                    if prev_id is not None:
+                        prev_step = end_pos - pos_um(prev_id)
+                        prev_norm = float(np.linalg.norm(prev_step))
+                        step_norm = float(np.linalg.norm(step))
+                        if prev_norm <= 0.01 or step_norm <= 0.01:
+                            ok_context = True
+                        else:
+                            cos = float(np.dot(prev_step, step) / (prev_norm * step_norm + 1e-9))
+                            if cos > -0.25 and np.linalg.norm(prev_step - step) <= 6.0:
+                                ok_context = True
+                            context_penalty += max(0.0, 0.25 - cos)
+                    next_id = successor.get(start_id)
+                    if next_id is not None:
+                        next_step = pos_um(next_id) - start_pos
+                        next_norm = float(np.linalg.norm(next_step))
+                        step_norm = float(np.linalg.norm(step))
+                        if next_norm <= 0.01 or step_norm <= 0.01:
+                            ok_context = True
+                        else:
+                            cos = float(np.dot(next_step, step) / (next_norm * step_norm + 1e-9))
+                            if cos > -0.25 and np.linalg.norm(next_step - step) <= 6.0:
+                                ok_context = True
+                            context_penalty += max(0.0, 0.25 - cos)
+                    if not ok_context:
+                        continue
+                proposals.append((dist + 2.0 * context_penalty, end_id, start_id, t, dist))
+
+    proposals.sort(key=lambda item: item[0])
+    stats["gap2_candidates"] = len(proposals)
+    if not proposals:
+        return nodes_by_id, edges
+
+    # 贪心选取：按排序键从小到大，跳过已用端点，并受全局上限与每帧上限约束。
+    selected: list[tuple[float, int, int, int, float]] = []
+    used_ends: set[int] = set()
+    used_starts: set[int] = set()
+    per_frame_count: dict[int, int] = {}
+    for proposal in proposals:
+        if len(selected) >= cap:
+            stats["gap2_skipped_cap"] += 1
+            break
+        _, end_id, start_id, t, _ = proposal
+        if end_id in used_ends or start_id in used_starts:
+            continue
+        frame_cap = max(1, int(round(len(ends_by_t.get(t, [])) * GAP2_FRAME_FRAC_CAP)))
+        if per_frame_count.get(t, 0) >= frame_cap:
+            continue
+        selected.append(proposal)
+        used_ends.add(end_id)
+        used_starts.add(start_id)
+        per_frame_count[t] = per_frame_count.get(t, 0) + 1
+
+    if not selected:
+        return nodes_by_id, edges
+
+    # 在 1/3、2/3 处插入两个节点：先线性插值，再做亮度质心精修（这里用一个新的局部帧缓存）。
+    next_node_id = _next_node_id(nodes_by_id)
+    frame_cache: dict[int, np.ndarray] = {}
+    new_edges: list[dict[str, object]] = []
+    for _, end_id, start_id, t, _ in selected:
+        source = nodes_by_id[end_id]
+        target = nodes_by_id[start_id]
+        previous_id = end_id
+        inserted_ids: list[int] = []
+        for k in (1, 2):
+            frac = k / 3.0
+            mid_t = int(source["t"]) + k
+            midpoint = (
+                float(source["z"]) + (float(target["z"]) - float(source["z"])) * frac,
+                float(source["y"]) + (float(target["y"]) - float(source["y"])) * frac,
+                float(source["x"]) + (float(target["x"]) - float(source["x"])) * frac,
+            )
+            refined_point = refine_synthetic_midpoint(dataset, mid_t, midpoint, frame_cache, stats)
+            node_id = next_node_id
+            next_node_id += 1
+            nodes_by_id[node_id] = {
+                "node_id": node_id,
+                "t": mid_t,
+                "z": refined_point[0],
+                "y": refined_point[1],
+                "x": refined_point[2],
+            }
+            inserted_ids.append(node_id)
+            current = nodes_by_id[node_id]
+            new_edges.append({
+                "source_id": previous_id,
+                "target_id": node_id,
+                "edge_prob": None,
+                "distance_um": edge_distance_um(nodes_by_id[previous_id], current),
+                "gap2_recovered": 1,
+            })
+            previous_id = node_id
+        new_edges.append({
+            "source_id": previous_id,
+            "target_id": start_id,
+            "edge_prob": None,
+            "distance_um": edge_distance_um(nodes_by_id[previous_id], target),
+            "gap2_recovered": 1,
+        })
+        stats["gap2_pairs_selected"] += 1
+        stats["gap2_added_nodes"] += len(inserted_ids)
+        stats["gap2_added_edges"] += 3
+
+    return nodes_by_id, [*edges, *new_edges]
+
+
+# ---- 低分峰池与找回 ----
+# 计数器自增（键不存在时从 0 开始）。
+def _gapfill_bump(stats: dict[str, int], key: str, n: int = 1) -> None:
+    stats[key] = int(stats.get(key, 0)) + n
+
+
+# 低分峰池：第 4 段推理时，除了正式检测（概率 > 0.965），还用阈值 0.3（BIOHUB_LOWDET_THRESHOLD）在同一张热图上
+#   再提一次峰，把所有分数高于 0.3 的局部极大（包括已成为节点的峰、被 ILP 丢掉的正式检测、低于 0.965 的亚阈值峰）
+#   连同 sigmoid 分数写进 BIOHUB_CACHE_DIR/<影像>.npz（键 low_coords = 每行 [t, z, y, x]、low_score）。
+# 这里读回来，交给 build_low_detection_pool 按调用时的节点集过滤；找回与低分峰补缺各调用一次，共用同一份转储。
+# 环境变量 BIOHUB_CACHE_DIR 在调用时才读取（第 0 段设为 /kaggle/working/edge_cache）；GAPFILL_MAX_GAP < 1、
+#   文件缺失或缺键时返回 None，找回与补缺随之空转（只打印提示，不报错）。
+#   注意：GAPFILL_MAX_GAP 本是低分峰补缺的参数，但找回也经过这里，所以把它设为 0 会连带关掉找回。
+def load_low_detections(
+    nodes_by_id: dict[int, dict[str, object]],
+    dataset: str | None,
+    stats: dict[str, int],
+) -> dict[int, dict[str, np.ndarray]] | None:
+    """按帧整理检测器的低分峰（来自第 4 段推理时的转储）。
+
+    低于 GAPFILL_MIN_SCORE 的峰、以及离本帧任何节点 ≤ GAPFILL_EXCLUDE_UM 的峰（其中就有节点自己的峰）被丢掉。
+    转储缺失或无法读取时返回 None，找回与补缺随之不做任何事。
+    """
+    cache_dir = os.environ.get("BIOHUB_CACHE_DIR", "").strip()
+    if GAPFILL_MAX_GAP < 1 or not cache_dir or not dataset:
+        return None
+    cache_path = Path(cache_dir) / f"{dataset}.npz"
+    if not cache_path.exists():
+        print(f"  [{dataset}] no low-detection dump at {cache_path}; gap filler idle")
+        return None
+    try:
+        with np.load(cache_path) as cz:
+            if "low_coords" not in cz.files:
+                print(f"  [{dataset}] dump has no low_coords; gap filler idle")
+                return None
+            low = np.asarray(cz["low_coords"], dtype=np.float64).reshape(-1, 4)
+            score = np.asarray(cz["low_score"], dtype=np.float64).reshape(-1)
+    except Exception as exc:
+        print(f"  [{dataset}] low-detection dump unreadable ({type(exc).__name__}: {exc}); gap filler idle")
+        return None
+    return build_low_detection_pool(nodes_by_id, low, score, stats, dataset)
+
+
+# 过滤低分峰：只保留分数 ≥ GAPFILL_MIN_SCORE（0.5）、且离本帧任何现有节点 > GAPFILL_EXCLUDE_UM（2.0 µm）的“自由峰”——
+#   离现有节点太近的峰多半就是这个节点自己（节点本来就是从同一张热图的峰里来的）。
+# 返回 {t: {"vox": 体素坐标, "um": µm 坐标, "score": 分数}}。
+def build_low_detection_pool(
+    nodes_by_id: dict[int, dict[str, object]],
+    low: np.ndarray,
+    score: np.ndarray,
+    stats: dict[str, int],
+    dataset: str | None = None,
+) -> dict[int, dict[str, np.ndarray]]:
+    keep = score >= GAPFILL_MIN_SCORE
+    low, score = low[keep], score[keep]
+    scale = np.array(VOXEL_SCALE_UM, dtype=np.float64)
+    node_um_by_t: dict[int, list] = {}
+    for node in nodes_by_id.values():
+        node_um_by_t.setdefault(int(node["t"]), []).append(np.array(node_point(node), dtype=np.float64) * scale)
+    pool: dict[int, dict[str, np.ndarray]] = {}
+    excluded = 0
+    for t in np.unique(low[:, 0]).astype(int).tolist() if len(low) else []:
+        sel = low[:, 0] == t
+        vox = low[sel, 1:]
+        um = vox * scale
+        sc = score[sel]
+        existing = node_um_by_t.get(t)
+        if existing:
+            d, _ = cKDTree(np.stack(existing)).query(um, k=1)
+            free = d > GAPFILL_EXCLUDE_UM
+            excluded += int((~free).sum())
+            vox, um, sc = vox[free], um[free], sc[free]
+        if len(vox):
+            pool[t] = {"vox": vox, "um": um, "score": sc}
+    n_free = int(sum(len(p["vox"]) for p in pool.values()))
+    _gapfill_bump(stats, "gapfill_pool_peaks", n_free)
+    _gapfill_bump(stats, "gapfill_pool_excluded", excluded)
+    if dataset is not None:
+        print(f"  [{dataset}] low-detection pool: {len(low)} peaks >= {GAPFILL_MIN_SCORE}, "
+              f"{excluded} on existing nodes, {n_free} free")
+    return pool
+
+
+# 找回：ILP 为了全局目标会丢掉一些真实检测（短而弱的链不如不要），检测器也会给一些真细胞打出略低于阈值的分数。
+#   若池中的自由峰离某条轨迹的“开放端” ≤ READMIT_RADIUS_UM（第 0 段设为 4 µm；代码缺省 0 = 关闭），
+#   且分数 ≥ READMIT_MIN_SCORE，就把它加回节点集。
+#   开放端：t−1 帧上没有出边的节点（轨迹末端）和 t+1 帧上没有入边的节点（轨迹起点），都在 t 帧形成锚点。
+# 找回阈值：第 2 段的缺省值 0.965 等于第 0 段设定的检测阈值，第 0 段下调到 0.94（取自讨论区公开帖），让 [0.94, 0.965) 的亚阈值峰
+#   也能进来。阈值是这一步精度的主要闸门：每多一个假节点，节点数调整项都要扣分。
+# 这里只加节点、不加边：随后的第二次重链接决定它接到哪里；接不上的找回节点保持孤立，之后可能被单帧缺口闭合复用为
+#   中间节点，否则在“删除孤立节点”一步被删掉。最终一遍里，找回节点还会被映射回原来的检测候选，继承它的模型概率
+#   （找回概率打分，见 filter_output_graph）。
+# 一个锚点附近可以找回多个峰（不做一对一限制）；任何异常都只打印提示，节点集保持不变。
+def readmit_discarded_detections(
+    nodes_by_id: dict[int, dict[str, object]],
+    edges: list[dict[str, object]],
+    stats: dict[str, int],
+    dataset: str | None = None,
+) -> dict[int, dict[str, object]]:
+    """把紧挨着轨迹开放端的检测峰（ILP 丢掉的检测，以及略低于检测阈值的峰）加回节点集。
+
+    条件：自由峰（离任何节点 > GAPFILL_EXCLUDE_UM）分数 ≥ READMIT_MIN_SCORE，且离 t−1 帧某个无出边的节点
+    或 t+1 帧某个无入边的节点 ≤ READMIT_RADIUS_UM。edges 是第一次重链接的结果；调用方随后再重链接一次，
+    新节点要么被接进轨迹，要么保持孤立、在删除孤立节点时被删掉。出错不致命：任何异常都保持节点集不变。
+    """
+    if READMIT_RADIUS_UM <= 0:
+        return nodes_by_id
+    try:
+        pool = load_low_detections(nodes_by_id, dataset, stats)
+        if not pool:
+            return nodes_by_id
+        # 锚点：无出边的节点在下一帧（t+1）形成锚点，无入边的节点在上一帧（t−1）形成锚点；孤立节点两侧都有。
+        has_out = {int(e["source_id"]) for e in edges}
+        has_in = {int(e["target_id"]) for e in edges}
+        scale = np.array(VOXEL_SCALE_UM, dtype=np.float64)
+        anchors: dict[int, list] = {}
+        for nid, node in nodes_by_id.items():
+            t = int(node["t"])
+            um = np.array(node_point(node), dtype=np.float64) * scale
+            if nid not in has_out:
+                anchors.setdefault(t + 1, []).append(um)
+            if nid not in has_in:
+                anchors.setdefault(t - 1, []).append(um)
+        next_id = _next_node_id(nodes_by_id)
+        added = 0
+        for t in sorted(pool):
+            near = anchors.get(int(t))
+            if not near:
+                continue
+            peaks = pool[t]
+            d, _ = cKDTree(np.stack(near)).query(peaks["um"], k=1)
+            # 峰到最近锚点 ≤ READMIT_RADIUS_UM 且分数 ≥ READMIT_MIN_SCORE 才找回。
+            keep = (d <= READMIT_RADIUS_UM) & (peaks["score"] >= READMIT_MIN_SCORE)
+            for vox in peaks["vox"][keep]:
+                nodes_by_id[next_id] = {"node_id": next_id, "t": int(t), "z": float(vox[0]), "y": float(vox[1]),
+                                        "x": float(vox[2]), "readmitted": 1}
+                next_id += 1
+                added += 1
+        _gapfill_bump(stats, "readmitted_nodes", added)
+        if dataset is not None:
+            print(f"  [{dataset}] readmitted {added} discarded detections within {READMIT_RADIUS_UM} um of an open end/start")
+    except Exception as exc:
+        print(f"  [{dataset}] readmit skipped (non-fatal): {type(exc).__name__}: {exc}")
+    return nodes_by_id
+
+
+# ---- 第 5 段（续）：后处理的后半部分 ----
+# 本部分依次定义：低分峰补缺 → 公开基线的安全分裂 → 短轨迹过滤 → 线拟合平滑 / 跳变感知平滑 → 找回概率打分
+# → 分裂补全打分器（内嵌源码并安装）→ 后处理总链 filter_output_graph → 加载 DeepCenter → 写提交 write_test_submission，
+# 最后立即对全部测试影片跑第一遍 pass。
+# 单位约定：节点坐标 z、y、x 是原始体素索引，乘 VOXEL_SCALE_UM（z 1.625 µm，y/x 0.40625 µm）换算成 µm；
+# z 方向的体素比 y/x 粗 4 倍，所以下面所有 *_UM 门限都在 µm 下比较。
+
+# 【低分峰补缺】（三级补缺的第三级，接在单帧缺口闭合、严格两帧缺口之后）
+# 为什么会断：细胞在某几帧变暗、或与邻居贴得太近时，检测分数掉到阈值 0.965 以下，轨迹就断成"t 帧末端 + t+g+1 帧起点"
+# 两段。缺口里的 GT 节点没有对应的预测，跨过缺口的 GT 边全部成为 FN（缺 g 帧就丢 g+1 条边）；
+# 断开的两段还可能因为太短，在后面的短轨迹过滤中被整段删掉。
+# 检测器在这些帧其实给出了亚阈值的"低分峰"（第 4 段推理时把分数 ≥ 0.3 的局部极大导出到 BIOHUB_CACHE_DIR/<影片>.npz）。
+# 这里只用分数 ≥ 0.5、且离现有节点 > 2 µm 的峰（load_low_detections），沿末端→起点的直线逐帧找真实峰，
+# 把 1～3 帧的缺口接起来。用真实峰而不是插值点：补出的节点有图像依据，位置更准，也更可能对应真实细胞。
+# 新增节点总数上限为节点数的 3%：指标的节点数调整项让每个多出来的节点都有代价（多报 10% 的节点扣 1%），补缺必须"少而准"。
+def fill_gaps_from_low_detections(
+    nodes_by_id: dict[int, dict[str, object]],
+    edges: list[dict[str, object]],
+    stats: dict[str, int],
+    dataset: str | None = None,
+    frame_cache: dict[int, np.ndarray] | None = None,
+    pool: dict[int, dict[str, np.ndarray]] | None = None,
+) -> tuple[dict[int, dict[str, object]], list[dict[str, object]]]:
+    """低分峰补缺：经由亚阈值检测峰，把 t 帧的轨迹末端接到 t+g+1 帧的轨迹起点（g = 1～3 个缺失帧）。
+
+    在单帧缺口闭合与严格两帧缺口之后运行，处理它们剩下的断口。对每个候选"末端-起点"对（跨度不超过
+    GAPFILL_STEP_UM × (g+1)，且通过方向一致性检查），沿末端→起点的直线在每个缺失帧取样，取样点
+    GAPFILL_PEAK_RADIUS_UM 范围内最近的空闲低分峰作为该帧的节点；每一帧都要有峰，最多允许
+    GAPFILL_ALLOW_SYNTHETIC 帧改用插值点（本 kernel 为 0，即不允许）。同一 (t, g) 的候选对按
+    "平均每帧步长 + 峰偏离直线的平均距离"做匈牙利分配，短缺口优先。新增节点总数不超过节点数的
+    GAPFILL_MAX_ADDED_FRAC。
+    """
+    if GAPFILL_MAX_GAP < 1 or not edges or not nodes_by_id:
+        return nodes_by_id, edges
+    if pool is None:
+        pool = load_low_detections(nodes_by_id, dataset, stats)
+    if not pool:
+        return nodes_by_id, edges
+    # 准备：位置换成 µm；找出每帧的轨迹末端（没有出边）和轨迹起点（没有入边）；为每帧的空闲低分峰建 KD 树，
+    # 并用 used_peak 记录哪些峰已被占用（一个峰只能补进一条轨迹）。预算只在开头算一次：节点数 × 3%。
+    scale = np.array(VOXEL_SCALE_UM, dtype=np.float64)
+    outgoing: dict[int, list[int]] = {}
+    incoming: dict[int, list[int]] = {}
+    for edge in edges:
+        outgoing.setdefault(int(edge["source_id"]), []).append(int(edge["target_id"]))
+        incoming.setdefault(int(edge["target_id"]), []).append(int(edge["source_id"]))
+    pos = {nid: np.array(node_point(node), dtype=np.float64) * scale for nid, node in nodes_by_id.items()}
+    ends_by_t: dict[int, list[int]] = {}
+    starts_by_t: dict[int, list[int]] = {}
+    for nid, node in nodes_by_id.items():
+        t = int(node["t"])
+        if nid not in outgoing:
+            ends_by_t.setdefault(t, []).append(nid)
+        if nid not in incoming:
+            starts_by_t.setdefault(t, []).append(nid)
+    trees = {t: cKDTree(p["um"]) for t, p in pool.items()}
+    used_peak = {t: np.zeros(len(p["um"]), dtype=bool) for t, p in pool.items()}
+    budget = int(round(len(nodes_by_id) * GAPFILL_MAX_ADDED_FRAC))
+    frame_cache = frame_cache if frame_cache is not None else {}
+    next_id = _next_node_id(nodes_by_id)
+    used_end: set[int] = set()
+    used_start: set[int] = set()
+    added_nodes = 0
+    new_edges: list[dict[str, object]] = []
+
+    # 方向一致性（GAPFILL_CONTEXT）：末端的来向（前驱→末端）、起点的去向（起点→后继）都不能与桥接方向相反——
+    # 夹角余弦必须 > −0.25（夹角小于约 104.5°）。细胞运动有惯性，方向突然反转多半是把两个不同细胞的轨迹错接了，
+    # 错接会同时产生假边并毁掉两条轨迹。跨度 ≤ 0.01 µm（几乎原地）时方向没有意义，直接放行。
+    def context_ok(end_id: int, start_id: int) -> bool:
+        if not GAPFILL_CONTEXT:
+            return True
+        step = pos[start_id] - pos[end_id]
+        sn = float(np.linalg.norm(step))
+        if sn <= 0.01:
+            return True
+        prev = incoming.get(end_id)
+        if prev:
+            other = pos[end_id] - pos[prev[0]]
+            on = float(np.linalg.norm(other))
+            if on > 0.01 and float(np.dot(other, step)) / (on * sn) <= -0.25:
+                return False
+        nxt = outgoing.get(start_id)
+        if nxt:
+            other = pos[nxt[0]] - pos[start_id]
+            on = float(np.linalg.norm(other))
+            if on > 0.01 and float(np.dot(other, step)) / (on * sn) <= -0.25:
+                return False
+        return True
+
+    # 匀速直线假设：第 k 个缺失帧的取样点 = 末端 + 跨度 × k/(g+1)，在该帧 3.5 µm 内找最近、尚未被占用的低分峰。
+    # 本 kernel 不允许插值点（GAPFILL_ALLOW_SYNTHETIC 为 0）：任何一帧找不到真实峰就放弃这条桥。
+    # 代价 = 平均每帧步长 |跨度|/(g+1) + 峰偏离直线的平均距离：步子越小、峰越贴近直线，越像同一个细胞。
+    def chain_for(end_id: int, start_id: int, g: int):
+        span = pos[start_id] - pos[end_id]
+        t0 = int(nodes_by_id[end_id]["t"])
+        items, dev, synthetic = [], [], 0
+        for k in range(1, g + 1):
+            q = pos[end_id] + span * (k / (g + 1))
+            tk = t0 + k
+            tree = trees.get(tk)
+            j = None
+            if tree is not None:
+                cand = [c for c in tree.query_ball_point(q, r=GAPFILL_PEAK_RADIUS_UM) if not used_peak[tk][c]]
+                if cand:
+                    dists = np.linalg.norm(pool[tk]["um"][cand] - q, axis=1)
+                    best = int(np.argmin(dists))
+                    j = cand[best]
+                    dev.append(float(dists[best]))
+            if j is None:
+                synthetic += 1
+                if synthetic > GAPFILL_ALLOW_SYNTHETIC:
+                    return None
+                dev.append(GAPFILL_PEAK_RADIUS_UM)
+            items.append((tk, j, q))
+        cost = float(np.linalg.norm(span)) / (g + 1) + (sum(dev) / len(dev) if dev else 0.0)
+        return cost, items
+
+    # 先补短缺口（g = 1）再补长缺口（g = 2、3）：短缺口依赖的低分峰更少、更可信，应优先占用末端、起点和峰。
+    # 距离门限随缺口线性放宽：5 µm × (g+1)，即 10 / 15 / 20 µm。预算用完就停止这一轮。
+    for g in range(1, GAPFILL_MAX_GAP + 1):
+        gate = GAPFILL_STEP_UM * (g + 1)
+        for t in sorted(ends_by_t):
+            if added_nodes + g > budget:
+                _gapfill_bump(stats, "gapfill_budget_hit")
+                break
+            ends = [e for e in ends_by_t[t] if e not in used_end]
+            starts = [s for s in starts_by_t.get(t + g + 1, []) if s not in used_start]
+            if not ends or not starts:
+                continue
+            end_pts = np.stack([pos[e] for e in ends])
+            start_pts = np.stack([pos[s] for s in starts])
+            start_tree = cKDTree(start_pts)
+            cost = np.full((len(ends), len(starts)), np.inf)
+            n_chains = 0
+            for i, js in enumerate(start_tree.query_ball_point(end_pts, r=gate)):
+                for j in js:
+                    if not context_ok(ends[i], starts[j]):
+                        continue
+                    chain = chain_for(ends[i], starts[j], g)
+                    if chain is None:
+                        continue
+                    cost[i, j] = chain[0]
+                    n_chains += 1
+            if n_chains == 0:
+                continue
+            _gapfill_bump(stats, "gapfill_candidates", n_chains)
+            # 同一 (t, g) 内全部"末端-起点"对一起做匈牙利一一分配（总代价最小），避免贪心时一个起点被先到的末端抢走；
+            # linear_sum_assignment 不接受 inf，不可行的对先用一个极大代价占位，分配后再丢掉。
+            finite = np.isfinite(cost)
+            big = float(np.max(cost[finite])) * 1000.0 + 1.0
+            row_ind, col_ind = linear_sum_assignment(np.where(finite, cost, big))
+            picks = sorted((float(cost[i, j]), int(i), int(j)) for i, j in zip(row_ind, col_ind) if finite[i, j])
+            for _, i, j in picks:
+                if added_nodes + g > budget:
+                    _gapfill_bump(stats, "gapfill_budget_hit")
+                    break
+                # 按代价从小到大逐条落实；前面的桥可能已经占用了某个峰（右侧英文注释的意思），所以重新取一次链，取不到就放弃。
+                chain = chain_for(ends[i], starts[j], g)  # an earlier pick may have taken a peak
+                if chain is None:
+                    continue
+                prev = ends[i]
+                # 新节点直接用低分峰的体素坐标，并打上 gapfill_peak 标记；新边没有链接概率（edge_prob = None），打 gap_filled 标记。
+                for tk, pk, q in chain[1]:
+                    nid = next_id
+                    next_id += 1
+                    if pk is not None:
+                        vox = pool[tk]["vox"][pk]
+                        used_peak[tk][pk] = True
+                        node = {"node_id": nid, "t": tk, "z": float(vox[0]), "y": float(vox[1]), "x": float(vox[2]), "gapfill_peak": 1}
+                        _gapfill_bump(stats, "gapfill_peak_nodes")
+                    else:
+                        p = q / scale
+                        refined = refine_synthetic_midpoint(dataset, tk, (float(p[0]), float(p[1]), float(p[2])), frame_cache, stats)
+                        node = {"node_id": nid, "t": tk, "z": float(refined[0]), "y": float(refined[1]), "x": float(refined[2]), "gap_synthetic": 1}
+                        _gapfill_bump(stats, "gapfill_synthetic_nodes")
+                    nodes_by_id[nid] = node
+                    new_edges.append({
+                        "source_id": prev, "target_id": nid, "edge_prob": None,
+                        "distance_um": edge_distance_um(nodes_by_id[prev], node), "gap_filled": 1,
+                    })
+                    prev = nid
+                    added_nodes += 1
+                new_edges.append({
+                    "source_id": prev, "target_id": starts[j], "edge_prob": None,
+                    "distance_um": edge_distance_um(nodes_by_id[prev], nodes_by_id[starts[j]]), "gap_filled": 1,
+                })
+                used_end.add(ends[i])
+                used_start.add(starts[j])
+                _gapfill_bump(stats, f"gapfill_pairs_g{g}")
+    _gapfill_bump(stats, "gapfill_added_nodes", added_nodes)
+    _gapfill_bump(stats, "gapfill_added_edges", len(new_edges))
+    if dataset is not None and new_edges:
+        print(f"  [{dataset}] gap filler: +{added_nodes} nodes, +{len(new_edges)} edges")
+    return nodes_by_id, [*edges, *new_edges]
+
+
+# 【公开基线的安全分裂】（用手工门限补分叉；分裂补全打分器随后在它的结果上追加，见下文 _D1_SOURCE）
+# 分裂 Jaccard 只承认出度 ≥ 2 的分叉。ILP 本身允许分裂，但运动重链接用匈牙利算法做一对一分配，并（正常情况下）
+# 替换掉全部 ILP 边，所以到这一步图里没有分叉；只靠一对一的关联，分裂项必然得 0。
+# 这里对"母细胞 P 只有一个子 A、t+1 帧有一个无父轨迹起点 B"的情形补上 P→B。
+# 门限（µm）：P→A ≤ 10、P→B ≤ 9、A–B ≤ 14；B 是离 A 最近的无父起点；两子在 t+2 帧继续分开 ≥ 2.25 µm；
+# B 处 DeepCenter 中心先验 ≥ 0.25；两子到母细胞的距离对称。数量上限：每帧 max(1, round(单子母细胞数 × 0.76%))，
+# 每部影片 max(1, round(边数 × 0.375%))。
+# 门限这么严，是因为普通步长与分裂步长的分布严重重叠（> 7 µm 的边里普通边是分裂边的 28 倍），只靠距离挑分裂会
+# 产生大量假分叉。代价是很多真分裂补不上——这正是后面分裂补全打分器要解决的问题。
+# 超时降级（_deadline_degrade）会把 OUTPUT_SAFE_DIVISIONS 关掉，此时直接返回原边。
+def add_safe_divisions_postlink(
+    nodes_by_id: dict[int, dict[str, object]],
+    edges: list[dict[str, object]],
+    stats: dict[str, int],
+    dataset: str | None = None,
+    deepcenter_bundle: dict[str, object] | None = None,
+    frame_cache: dict[int, np.ndarray] | None = None,
+    deepcenter_cache: dict[tuple[str, int], np.ndarray] | None = None,
+) -> list[dict[str, object]]:
+    if not OUTPUT_SAFE_DIVISIONS or not edges or not nodes_by_id:
+        return edges
+    frame_cache = frame_cache if frame_cache is not None else {}
+    deepcenter_cache = deepcenter_cache if deepcenter_cache is not None else {}
+ 
+    out_by_source: dict[int, list[dict[str, object]]] = {}
+    incoming: set[int] = set()
+    for edge in edges:
+        out_by_source.setdefault(int(edge["source_id"]), []).append(edge)
+        incoming.add(int(edge["target_id"]))
+ 
+    ids_by_t: dict[int, list[int]] = {}
+    for node_id, node in nodes_by_id.items():
+        ids_by_t.setdefault(int(node["t"]), []).append(node_id)
+ 
+    existing_edges = {(int(edge["source_id"]), int(edge["target_id"])) for edge in edges}
+    global_cap = max(1, int(round(max(1, len(edges)) * SAFE_DIV_GLOBAL_FRAC_CAP)))
+    added: list[dict[str, object]] = []
+    used_targets: set[int] = set()
+    used_sources: set[int] = set()  
+ 
+    # 逐帧处理：源 = t 帧中恰有一条出边的节点（单子母细胞）；候选 = t+1 帧中没有父亲、也还没被用过的节点。
+    for t in sorted(ids_by_t):
+        child_frame_ids = ids_by_t.get(t + 1, [])
+        if not child_frame_ids:
+            continue
+        source_ids = [node_id for node_id in ids_by_t[t] if len(out_by_source.get(node_id, [])) == 1]
+        candidate_ids = [node_id for node_id in child_frame_ids if node_id not in incoming and node_id not in used_targets]
+        if not source_ids or not candidate_ids:
+            continue
+ 
+        
+        
+        
+        
+        
+        # "最近邻"检查用的 KD 树：候选 B 必须正是现有子细胞 A 在全部无父起点中的最近者（虽然变量名叫 mutual，
+        # 实际只检查 A→起点这一个方向）。刚分开的两个子细胞紧挨着，A 最近的空闲起点最可能就是它的姐妹。
+        candidate_tree = None
+        if SAFE_DIV_REQUIRE_MUTUAL_NN:
+            candidate_positions = np.stack([_position_um(nodes_by_id[cid]) for cid in candidate_ids])
+            candidate_tree = cKDTree(candidate_positions)
+ 
+        # 每帧上限 = max(1, round(源数 × 0.76%))。
+        frame_cap = max(1, int(round(len(source_ids) * SAFE_DIV_FRAME_FRAC_CAP)))
+        proposals: list[tuple[float, int, int, float, float]] = []
+        for source_id in source_ids:
+            source = nodes_by_id[source_id]
+            existing_child_edge = out_by_source[source_id][0]
+            existing_child_id = int(existing_child_edge["target_id"])
+            existing_child = nodes_by_id.get(existing_child_id)
+            if existing_child is None or int(existing_child["t"]) != t + 1:
+                continue
+            # 门限：P→A ≤ 10 µm（现有的那条母→子边本身要像一次正常的分裂步）。
+            child_dist = edge_distance_um(source, existing_child)
+            if child_dist > SAFE_DIV_EXISTING_CHILD_MAX_UM:
+                continue
+ 
+            
+            
+            
+            
+            # 离 A 最近的无父起点（每个 P 只查一次）。
+            mutual_nn_id = None
+            if candidate_tree is not None:
+                _, nn_idx = candidate_tree.query(_position_um(existing_child))
+                mutual_nn_id = candidate_ids[int(nn_idx)]
+ 
+            for candidate_id in candidate_ids:
+                if (source_id, candidate_id) in existing_edges:
+                    continue
+                candidate = nodes_by_id[candidate_id]
+                # 门限：P→B ≤ 9 µm、姐妹间距 A–B ≤ 14 µm。
+                parent_dist = edge_distance_um(source, candidate)
+                if parent_dist > SAFE_DIV_MAX_UM:
+                    continue
+                sister_dist = edge_distance_um(existing_child, candidate)
+                if sister_dist > SAFE_DIV_SISTER_MAX_UM:
+                    continue
+ 
+                
+                if SAFE_DIV_REQUIRE_MUTUAL_NN and candidate_id != mutual_nn_id:
+                    stats["safe_division_mutual_nn_rejected"] += 1
+                    continue
+ 
+                
+                
+                
+                
+                # 发散检查：A、B 在 t+2 帧都必须恰有一个后继，且孙代间距比姐妹间距至少大 2.25 µm。
+                # 分裂后两个子细胞会持续远离；检测抖动造成的"假姐妹"不会系统性地分开。
+                if SAFE_DIV_REQUIRE_DIVERGENCE:
+                    c1_succ = out_by_source.get(existing_child_id, [])
+                    q_succ = out_by_source.get(candidate_id, [])
+                    if len(c1_succ) != 1 or len(q_succ) != 1:
+                        stats["safe_division_divergence_rejected"] += 1
+                        continue
+                    c1_grandchild = nodes_by_id.get(int(c1_succ[0]["target_id"]))
+                    q_grandchild = nodes_by_id.get(int(q_succ[0]["target_id"]))
+                    if (
+                        c1_grandchild is None or q_grandchild is None
+                        or int(c1_grandchild["t"]) != t + 2
+                        or int(q_grandchild["t"]) != t + 2
+                    ):
+                        stats["safe_division_divergence_rejected"] += 1
+                        continue
+                    grandchild_dist = edge_distance_um(c1_grandchild, q_grandchild)
+                    if grandchild_dist - sister_dist < SAFE_DIV_DIVERGE_UM:
+                        stats["safe_division_divergence_rejected"] += 1
+                        continue
+ 
+                # 注意：这个计数在 DeepCenter 否决和对称检查之前，所以日志里的 deepcenter_rejected 也包含了对称性拒绝。
+                stats["safe_division_geometric_candidates"] += 1
+                # DeepCenter 否决：独立训练的公开 3D U-Net 输出"细胞中心"热图，候选 B 周围小窗（t+1 帧）内的最大值 < 0.25 就拒绝。
+                # B 是图里已有的无父起点（可能是正式检测，也可能是找回或补缺加进来的低分峰），这道门防止把假检测当成
+                # 第二个子细胞。模型或热图缺失时放行。
+                if DEEPCENTER_SAFE_DIV_VETO and not deepcenter_accept_repair_point(
+                    dataset,
+                    int(candidate["t"]),
+                    node_point(candidate),
+                    deepcenter_bundle,
+                    frame_cache,
+                    deepcenter_cache,
+                    stats,
+                    "safe_div",
+                    DEEPCENTER_SAFE_DIV_THRESHOLD,
+                ):
+                    continue
+                
+                
+                
+                
+                
+                
+                # 对称性：|P→A − P→B| / 两者均值 ≤ 0.6——分裂是母细胞一分为二、向两侧推开，两个子细胞离母细胞的距离应相近。
+                if SAFE_DIV_SISTER_SYMMETRY_TAU > 0.0:
+                    _sym_denom = max((child_dist + parent_dist) / 2.0, 1e-6)
+                    if abs(child_dist - parent_dist) / _sym_denom > SAFE_DIV_SISTER_SYMMETRY_TAU:
+                        stats["safe_division_symmetry_rejected"] += 1
+                        continue
+                # 排序分 = P→B 距离 + 0.15 × 姐妹距离，越小越优先。
+                score = parent_dist + 0.15 * sister_dist
+                proposals.append((score, source_id, candidate_id, parent_dist, sister_dist))
+ 
+        stats["safe_division_candidates"] += len(proposals)
+        if not proposals:
+            continue
+        # 按排序分从小到大补边：每个母细胞、每个候选只用一次；达到全局上限或本帧上限就停——宁可少补，也不要大量假分叉。
+        # 新边不带链接概率（edge_prob = None），safe_division 标记只作记录，下游不读取。
+        proposals.sort(key=lambda item: item[0])
+        added_this_frame = 0
+        for _, source_id, candidate_id, parent_dist, _ in proposals:
+            if len(added) >= global_cap:
+                stats["safe_division_skipped_cap"] += 1
+                break
+            if added_this_frame >= frame_cap:
+                break
+            if candidate_id in used_targets or candidate_id in incoming:
+                continue
+            if source_id in used_sources:
+                continue
+            candidate = nodes_by_id[candidate_id]
+            added.append({
+                "source_id": source_id,
+                "target_id": candidate_id,
+                "edge_prob": None,
+                "distance_um": parent_dist,
+                "safe_division": 1,
+            })
+            used_targets.add(candidate_id)
+            used_sources.add(source_id)
+            added_this_frame += 1
+ 
+    if added:
+        stats["safe_divisions_added"] = len(added)
+        return [*edges, *added]
+    return edges
+
+
+# 【短轨迹过滤】用并查集求弱连通分量（同一棵谱系树上的节点），删除节点数 < 6 且不含分裂的分量。
+# 极短的碎片多来自假检测或断裂残片。指标的边项只对与 GT 冲突的边记 FP，但所有预测节点都进入节点数调整项，
+# 所以删掉低价值的碎片节点能直接提高调整后的边 Jaccard。含分裂（出度 ≥ 2）的分量保留，以免误删分裂项可能得分的结构。
+def filter_short_track_components(
+    nodes_by_id: dict[int, dict[str, object]],
+    edges: list[dict[str, object]],
+    stats: dict[str, int],
+) -> tuple[dict[int, dict[str, object]], list[dict[str, object]]]:
+    if not OUTPUT_FILTER_SHORT_TRACKS or OUTPUT_MIN_TRACK_LEN <= 1 or not edges:
+        return nodes_by_id, edges
+
+    # 并查集（带路径压缩）：把每条边的两端合并，得到弱连通分量；同时统计每个节点的出度。
+    parent = {node_id: node_id for node_id in nodes_by_id}
+
+    def find(node_id: int) -> int:
+        while parent[node_id] != node_id:
+            parent[node_id] = parent[parent[node_id]]
+            node_id = parent[node_id]
+        return node_id
+
+    def union(a: int, b: int) -> None:
+        if a not in parent or b not in parent:
+            return
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    out_count: dict[int, int] = {}
+    for edge in edges:
+        source_id = int(edge["source_id"])
+        target_id = int(edge["target_id"])
+        union(source_id, target_id)
+        out_count[source_id] = out_count.get(source_id, 0) + 1
+
+    components: dict[int, list[int]] = {}
+    for node_id in nodes_by_id:
+        components.setdefault(find(node_id), []).append(node_id)
+
+    component_edges: dict[int, list[dict[str, object]]] = {root: [] for root in components}
+    for edge in edges:
+        source_id = int(edge["source_id"])
+        target_id = int(edge["target_id"])
+        if source_id in parent and target_id in parent:
+            component_edges.setdefault(find(source_id), []).append(edge)
+
+    # 保留条件：分量的节点数 ≥ 6（OUTPUT_MIN_TRACK_LEN，按节点数而不是帧数），或分量里有出度 ≥ 2 的节点（含分裂）。
+    keep: set[int] = set()
+    for root, members in components.items():
+        has_division = any(out_count.get(node_id, 0) >= 2 for node_id in members)
+        if len(members) >= OUTPUT_MIN_TRACK_LEN or (OUTPUT_KEEP_DIVISION_COMPONENTS and has_division):
+            keep.update(members)
+
+    # 全部都要删时说明这部影片异常（例如检测极稀疏），干脆一个都不删，避免输出空图。
+    if not keep:
+        stats["short_track_filter_skipped_all"] += 1
+        return nodes_by_id, edges
+
+    removed_before_rescue = len(nodes_by_id) - len(keep)
+    if removed_before_rescue <= 0:
+        return nodes_by_id, edges
+
+    # 自适应救回：若这部影片被删的节点比例 ≥ 10%（通常是检测稀疏、轨迹普遍偏短的影片），一刀切会删掉太多真轨迹，
+    # 于是从 4～5 个节点的分量里救回"平均链接概率 ≥ 0.88、平均步长 ≤ 3 µm"的高置信短轨迹，
+    # 按 平均概率 − 0.02 × 平均步长 + 0.004 × 节点数 从高到低选，总预算 min(120, 节点数 × 1.2%)；放不下的跳过、不停止。
+    if ADAPTIVE_SHORT_TRACK_RESCUE:
+        removed_frac = removed_before_rescue / max(len(nodes_by_id), 1)
+        if removed_frac >= SHORT_TRACK_RESCUE_TRIGGER_REMOVED_FRAC:
+            budget = min(
+                SHORT_TRACK_RESCUE_MAX_NODES_ABS,
+                max(0, int(round(len(nodes_by_id) * SHORT_TRACK_RESCUE_MAX_NODES_FRAC))),
+            )
+            stats["short_track_rescue_triggered"] = 1
+            stats["short_track_rescue_budget"] = budget
+            proposals: list[tuple[float, int, float, int, list[int]]] = []
+            for root, members in components.items():
+                if set(members) & keep:
+                    continue
+                if len(members) < SHORT_TRACK_RESCUE_MIN_LEN or len(members) >= OUTPUT_MIN_TRACK_LEN:
+                    continue
+                c_edges = component_edges.get(root, [])
+                if not c_edges:
+                    continue
+                # 没有概率的边（补缺补出的边等，edge_prob = None）按概率 0 计入平均值。
+                probs: list[float] = []
+                dists: list[float] = []
+                for edge in c_edges:
+                    try:
+                        prob = float(edge.get("edge_prob", 0.0))
+                    except (TypeError, ValueError):
+                        prob = 0.0
+                    if np.isfinite(prob):
+                        probs.append(prob)
+                    try:
+                        dist = float(edge.get("distance_um", np.nan))
+                    except (TypeError, ValueError):
+                        dist = np.nan
+                    if np.isfinite(dist):
+                        dists.append(dist)
+                mean_prob = float(np.mean(probs)) if probs else 0.0
+                mean_dist = float(np.mean(dists)) if dists else float("inf")
+                if mean_prob < SHORT_TRACK_RESCUE_MIN_MEAN_EDGE_PROB:
+                    continue
+                if mean_dist > SHORT_TRACK_RESCUE_MAX_MEAN_EDGE_DIST_UM:
+                    continue
+                score = mean_prob - 0.02 * mean_dist + 0.004 * len(members)
+                proposals.append((score, len(members), mean_prob, root, members))
+            proposals.sort(reverse=True)
+            rescued_nodes = 0
+            rescued_components = 0
+            for _, size, _, _, members in proposals:
+                if budget <= 0 or rescued_nodes + size > budget:
+                    continue
+                keep.update(members)
+                rescued_nodes += size
+                rescued_components += 1
+            stats["short_track_rescue_components"] = rescued_components
+            stats["short_track_rescue_nodes"] = rescued_nodes
+
+    removed_nodes = len(nodes_by_id) - len(keep)
+    if removed_nodes <= 0:
+        return nodes_by_id, edges
+
+    # 删除节点后，端点被删的边也一并删除。
+    kept_nodes = {node_id: node for node_id, node in nodes_by_id.items() if node_id in keep}
+    kept_edges = [
+        edge for edge in edges
+        if int(edge["source_id"]) in kept_nodes and int(edge["target_id"]) in kept_nodes
+    ]
+    stats["short_track_components_removed"] = sum(1 for members in components.values() if not (set(members) & keep))
+    stats["short_track_nodes_removed"] = removed_nodes
+    stats["short_track_edges_removed"] = len(edges) - len(kept_edges)
+    return kept_nodes, kept_edges
+
+
+# 【线拟合平滑】（公开基线原有；只改坐标、不改拓扑）
+# 对每个节点，沿"唯一前驱 / 唯一后继"的链前后各取最多 2 帧；点数 ≥ 3 时，对 z、y、x 分别以帧差为自变量拟合一条直线，
+# 取本帧（帧差 0）处的拟合值，新位置 = 0.2 × 原位置 + 0.8 × 拟合值。
+# 原理：5 帧内细胞近似匀速运动，单帧检测的定位噪声（主要在 z 方向，一层 1.625 µm）被相邻帧平均掉；
+# 坐标更准，评分时的 7 µm 节点匹配和写 CSV 时的取整都更接近真实位置。
+# 所有拟合都基于平滑前的原始坐标（结果不会连锁传播）；遇到多个前驱或后继就停止向那个方向延伸。
+# 各轴独立拟合（体素单位），所以 z 与 y/x 的分辨率不同不影响结果。
+def linefit_smooth_output_graph(
+    nodes_by_id: dict[int, dict[str, object]],
+    edges: list[dict[str, object]],
+    stats: dict[str, int],
+) -> dict[int, dict[str, object]]:
+    """平滑线性轨迹内部节点的坐标，不改变图的拓扑。"""
+    if not OUTPUT_LINEFIT_SMOOTH or OUTPUT_LINEFIT_WEIGHT <= 0 or OUTPUT_LINEFIT_WINDOW <= 0 or not edges:
+        return nodes_by_id
+
+    # 只用相邻帧的边（t → t+1）建立前驱 / 后继表。
+    predecessor: dict[int, list[int]] = {}
+    successor: dict[int, list[int]] = {}
+    for edge in edges:
+        source_id = int(edge["source_id"])
+        target_id = int(edge["target_id"])
+        source = nodes_by_id.get(source_id)
+        target = nodes_by_id.get(target_id)
+        if source is None or target is None:
+            continue
+        if int(target["t"]) != int(source["t"]) + 1:
+            continue
+        successor.setdefault(source_id, []).append(target_id)
+        predecessor.setdefault(target_id, []).append(source_id)
+
+    original_pos = {
+        node_id: np.array([float(node["z"]), float(node["y"]), float(node["x"])], dtype=np.float64)
+        for node_id, node in nodes_by_id.items()
+    }
+    updated_pos: dict[int, np.ndarray] = {}
+    weight = float(np.clip(OUTPUT_LINEFIT_WEIGHT, 0.0, 1.0))
+
+    # 以本节点为中心，向前、向后各沿唯一的前驱 / 后继走最多 OUTPUT_LINEFIT_WINDOW（2）步，收集 (帧差, 节点)。
+    for node_id in sorted(nodes_by_id):
+        neighbourhood: list[tuple[int, int]] = [(0, node_id)]
+
+        current = node_id
+        for step in range(1, OUTPUT_LINEFIT_WINDOW + 1):
+            prev_ids = predecessor.get(current, [])
+            if len(prev_ids) != 1:
+                break
+            current = prev_ids[0]
+            if current not in original_pos:
+                break
+            neighbourhood.append((-step, current))
+
+        current = node_id
+        for step in range(1, OUTPUT_LINEFIT_WINDOW + 1):
+            next_ids = successor.get(current, [])
+            if len(next_ids) != 1:
+                break
+            current = next_ids[0]
+            if current not in original_pos:
+                break
+            neighbourhood.append((step, current))
+
+        if len(neighbourhood) < 3:
+            stats["linefit_skipped_nodes"] += 1
+            continue
+
+        # 每个轴拟合一条一次直线 coord = a × 帧差 + b，取帧差 0 处的值 b；再与原位置按权重 0.8 混合（保留一点原始观测）。
+        dts = np.array([delta for delta, _ in neighbourhood], dtype=np.float64)
+        coords = np.stack([original_pos[nid] for _, nid in neighbourhood])
+        fitted = np.array([np.polyval(np.polyfit(dts, coords[:, axis], 1), 0.0) for axis in range(3)], dtype=np.float64)
+        if not np.isfinite(fitted).all():
+            stats["linefit_skipped_nodes"] += 1
+            continue
+        updated_pos[node_id] = (1.0 - weight) * original_pos[node_id] + weight * fitted
+
+    # 全部节点拟合完后统一写回。
+    for node_id, pos in updated_pos.items():
+        nodes_by_id[node_id]["z"] = float(pos[0])
+        nodes_by_id[node_id]["y"] = float(pos[1])
+        nodes_by_id[node_id]["x"] = float(pos[2])
+
+    stats["linefit_smoothed_nodes"] = len(updated_pos)
+    return nodes_by_id
+
+
+# 【跳变感知平滑】（本方案新增；随 _G1X1_ACTIVE 在第 11 段打开、第一遍 pass 中关闭，与重链接中的"全局位移估计"是一对）
+# 有些帧对之间整个视野一起平移数微米（载物台漂移、胚胎整体移动），每条轨迹在这一步都有一个"台阶"。
+# 普通线拟合穿过台阶，会把台阶两侧的节点都往中间拉，反而把正确坐标改错。
+# 做法：先估计每个帧对的整体跳变，把累计跳变量从坐标中减去（变成"无漂移"的坐标系），在其中做普通线拟合，再把跳变量加回。
+# 没有检测到跳变的影片，结果与普通线拟合完全相同；这里出现任何异常也退回普通线拟合，不会让整部影片失败。
+def linefit_smooth_jump_aware(
+    nodes_by_id: dict[int, dict[str, object]],
+    edges: list[dict[str, object]],
+    stats: dict[str, int],
+) -> dict[int, dict[str, object]]:
+    """先扣除整帧跳变、再做线拟合平滑的 linefit_smooth_output_graph。
+
+    如果某个帧对之间整个视野一起移动，每条轨迹在这一步都有一个台阶，穿过台阶拟合的直线会把台阶两侧的节点
+    往中间拉。这里先把这些帧对的累计位移从坐标中减去，拟合后再加回。没有这种帧对的影片、以及这里的任何
+    失败，都改用原函数平滑。
+    """
+    # 开关关闭（第一遍 pass）或跳变门限 ≤ 0 时，与原函数完全相同。
+    if not _G1X1_ACTIVE or OUTPUT_LINEFIT_JUMP_MIN_UM <= 0:
+        return linefit_smooth_output_graph(nodes_by_id, edges, stats)
+    if not OUTPUT_LINEFIT_SMOOTH or OUTPUT_LINEFIT_WEIGHT <= 0 or OUTPUT_LINEFIT_WINDOW <= 0 or not edges:
+        return nodes_by_id
+    stats["linefit_jump_pairs"] = 0
+    try:
+        # 收集每个帧对 t → t+1 的全部边位移（体素单位）。
+        steps: dict[int, list[tuple[float, float, float]]] = {}
+        for edge in edges:
+            source = nodes_by_id.get(int(edge["source_id"]))
+            target = nodes_by_id.get(int(edge["target_id"]))
+            if source is None or target is None or int(target["t"]) != int(source["t"]) + 1:
+                continue
+            steps.setdefault(int(source["t"]), []).append((
+                float(target["z"]) - float(source["z"]),
+                float(target["y"]) - float(source["y"]),
+                float(target["x"]) - float(source["x"]),
+            ))
+        frames = max(int(node["t"]) for node in nodes_by_id.values()) + 1
+        scale = np.asarray(VOXEL_SCALE_UM, dtype=np.float64)
+        jump = np.zeros((frames, 3), dtype=np.float64)
+        # 整体跳变的估计：取该帧对全部边位移的逐轴中位数（至少 20 条边才估计）。中位数对少数错连的边不敏感，不需要任何链接概率；
+        # 中位位移换算成 µm 后 ≥ 3 µm 才算整体跳变（正常细胞每帧位移的中位数约 1.8 µm）。
+        for t, frame_steps in steps.items():
+            if len(frame_steps) < 20:
+                continue
+            median_step = np.median(np.asarray(frame_steps, dtype=np.float64), axis=0)
+            if float(np.linalg.norm(median_step * scale)) >= OUTPUT_LINEFIT_JUMP_MIN_UM:
+                jump[t] = median_step
+        jump_pairs = int(jump.any(axis=1).sum())
+        updated: dict[int, tuple[float, float, float]] = {}
+        scratch_stats = dict(stats)
+        if jump_pairs:
+            # 累计偏移：offset[t] = t 帧之前所有帧对的跳变量之和（体素单位）；减去它，就把第 t 帧平移回无漂移的坐标系。
+            offset = np.vstack([np.zeros(3), np.cumsum(jump, axis=0)])[:frames]
+            shifted: dict[int, dict[str, object]] = {}
+            for node_id, node in nodes_by_id.items():
+                back = offset[int(node["t"])]
+                moved = dict(node)
+                moved["z"] = float(node["z"]) - float(back[0])
+                moved["y"] = float(node["y"]) - float(back[1])
+                moved["x"] = float(node["x"]) - float(back[2])
+                shifted[node_id] = moved
+            # 在平移后的副本上做普通线拟合（统计写进 scratch_stats），只对确实被平滑的节点把偏移加回。
+            before = {node_id: (node["z"], node["y"], node["x"]) for node_id, node in shifted.items()}
+            linefit_smooth_output_graph(shifted, edges, scratch_stats)
+            for node_id, node in shifted.items():
+                if (node["z"], node["y"], node["x"]) == before[node_id]:
+                    continue
+                back = offset[int(node["t"])]
+                position = (
+                    float(node["z"]) + float(back[0]),
+                    float(node["y"]) + float(back[1]),
+                    float(node["x"]) + float(back[2]),
+                )
+                if not all(math.isfinite(value) for value in position):
+                    raise ValueError(f"non-finite smoothed position for node {node_id}")
+                updated[node_id] = position
+    except Exception:
+        stats["linefit_jump_errors"] = stats.get("linefit_jump_errors", 0) + 1
+        return linefit_smooth_output_graph(nodes_by_id, edges, stats)
+    if not jump_pairs:
+        return linefit_smooth_output_graph(nodes_by_id, edges, stats)
+    for node_id, position in updated.items():
+        nodes_by_id[node_id]["z"] = position[0]
+        nodes_by_id[node_id]["y"] = position[1]
+        nodes_by_id[node_id]["x"] = position[2]
+    stats["linefit_smoothed_nodes"] = scratch_stats["linefit_smoothed_nodes"]
+    stats["linefit_skipped_nodes"] = scratch_stats["linefit_skipped_nodes"]
+    stats["linefit_jump_pairs"] = jump_pairs
+    return nodes_by_id
+
+
+# 本方案新增的三个后处理开关。第一遍 pass 中全部为 False；第 11 段的最终 pass 把它们打开（下文说"最终 pass"
+# 即指此）。只在 4 部可见测试影片上运行的诊断 pass 也会打开这三个开关和 _G1X1_ACTIVE，但不打开分裂补全打分器。
+#   _DR_ACTIVE：候选概率重链接——把预测阶段导出的稠密候选对概率都送进重链接（公开基线只给 ILP 边概率）；
+#   _D4_ACTIVE：关联特征修正——重链接改用修正后重算的关联概率 d4_prob；
+#   _RR_ACTIVE：找回概率打分——找回的节点映射回检测候选，继承它的链接概率（见下一个函数）。
+#   后两个开关都依附于 _DR_ACTIVE：d4_prob 和检测候选信息都存在稠密候选缓存里，filter_output_graph 只在
+#   _DR_ACTIVE 为真时读这份缓存，所以 _DR_ACTIVE 关闭时它们不起作用。
+_DR_ACTIVE = False
+_D4_ACTIVE = False
+_RR_ACTIVE = False
+
+
+# 【找回概率打分】找回的节点不是 ILP 节点，在公开基线里没有任何链接概率（p = 0），第二次重链接只能靠几何。
+# 这里把每个找回的节点映射回预测阶段的检测器候选（稠密候选缓存里存了每个候选的编号和坐标）：
+# 最近候选 ≤ 2 µm、次近候选至少再远 1 µm、且该候选只被一个找回节点认领；映射成功后，把缓存中该候选参与的
+# 全部候选对概率复制给新节点（另一端也必须是 ILP 节点或已映射的找回节点）。
+# 条件很严：宁可不映射，也不映射错；编号或帧号对不上时主动报错，由写提交时的逐片兜底处理。
+def _rr_expand_probabilities(dataset, nodes_by_id, original_ids, cache_path,
+                             source_ids, target_ids, probabilities, base_probs):
+    """把能唯一确定的找回峰映射到检测器候选，并展开这些候选参与的全部候选对概率。"""
+    with np.load(cache_path, allow_pickle=False) as cache:
+        candidate_ids = np.asarray(cache["detector_node_ids"], dtype=np.int64)
+        candidate_coords = np.asarray(cache["detector_coords"], dtype=np.float64)
+    if candidate_coords.ndim != 2 or candidate_coords.shape[1] != 4 or len(candidate_ids) != len(candidate_coords):
+        raise RuntimeError(f"{dataset}: malformed detector provenance")
+    if len(set(map(int, candidate_ids))) != len(candidate_ids):
+        raise RuntimeError(f"{dataset}: nonunique detector IDs")
+    original_ids = set(map(int, original_ids))
+    readmitted = {int(k): v for k, v in nodes_by_id.items() if int(k) not in original_ids and v.get("readmitted")}
+    # 候选池：不在 ILP 节点集里的检测器候选，按帧建 KD 树（µm）。
+    pool = {}
+    scale = np.asarray(VOXEL_SCALE_UM, dtype=np.float64)
+    for cid, coord in zip(candidate_ids, candidate_coords):
+        if int(cid) not in original_ids:
+            pool.setdefault(int(coord[0]), []).append((int(cid), np.asarray(coord[1:4]) * scale))
+    per_frame = {}
+    for t, entries in pool.items():
+        per_frame[t] = (np.asarray([x[0] for x in entries], dtype=np.int64),
+                        cKDTree(np.asarray([x[1] for x in entries], dtype=np.float64)))
+    proposed = {}
+    rejected = {"no_frame": 0, "too_far": 0, "small_margin": 0, "collision": 0}
+    # 映射门限：最近 ≤ 2 µm（找回峰与检测候选本应是同一个局部极大），且与次近至少差 1 µm（不含糊）。
+    for new_id, node in readmitted.items():
+        frame = per_frame.get(int(node["t"]))
+        if frame is None:
+            rejected["no_frame"] += 1
+            continue
+        ids, tree = frame
+        distances, indices = tree.query(np.asarray(node_point(node)) * scale, k=min(2, len(ids)))
+        distances = np.atleast_1d(distances)
+        indices = np.atleast_1d(indices)
+        if not np.isfinite(distances[0]) or distances[0] > 2.0 + 1e-5:
+            rejected["too_far"] += 1
+        elif len(distances) > 1 and distances[1] - distances[0] < 1.0:
+            rejected["small_margin"] += 1
+        else:
+            proposed[new_id] = int(ids[int(indices[0])])
+    # 一个候选被多个找回节点认领时全部放弃（collision）。
+    claims = {}
+    for new_id, candidate_id in proposed.items():
+        claims.setdefault(candidate_id, []).append(new_id)
+    candidate_to_new = {}
+    for candidate_id, new_ids in claims.items():
+        if len(new_ids) == 1:
+            candidate_to_new[candidate_id] = new_ids[0]
+        else:
+            rejected["collision"] += len(new_ids)
+    # 复制概率：缓存里任一端是已映射候选的候选对，换成新节点编号后写进概率字典；两端都必须在图里，且必须恰好相差一帧。
+    expanded = dict(base_probs)
+    touched = 0
+    both_readmitted = 0
+    for source_id, target_id, prob in zip(source_ids, target_ids, probabilities):
+        s, t = int(source_id), int(target_id)
+        if s not in candidate_to_new and t not in candidate_to_new:
+            continue
+        if not np.isfinite(prob):
+            continue
+        if s not in original_ids and s not in candidate_to_new:
+            continue
+        if t not in original_ids and t not in candidate_to_new:
+            continue
+        new_s = candidate_to_new.get(s, s)
+        new_t = candidate_to_new.get(t, t)
+        if new_s not in nodes_by_id or new_t not in nodes_by_id:
+            raise RuntimeError(f"{dataset}: invalid remapped candidate endpoint")
+        if int(nodes_by_id[new_t]["t"]) != int(nodes_by_id[new_s]["t"]) + 1:
+            raise RuntimeError(f"{dataset}: invalid remapped candidate time")
+        expanded[(new_s, new_t)] = float(prob)
+        touched += 1
+        both_readmitted += int(s in candidate_to_new and t in candidate_to_new)
+    details = {"readmitted_total": len(readmitted), "unique_origins": len(candidate_to_new),
+               "unmatched_or_ambiguous": len(readmitted) - len(candidate_to_new),
+               "rejected": rejected, "cached_competing_rows": touched,
+               "cached_competing_unique_edges": len(expanded) - len(base_probs),
+               "both_readmitted_rows": both_readmitted}
+    return expanded, details
+
+
+# ---- 分裂补全打分器：运行参数 + 内嵌源码（模块先在训练影像上离线评估，再把同一份代码原样内嵌到这里；教学版只加了中文注释）----
+# 这些全局变量优先于模块内 DEFAULTS 的同名值（模块的 _knobs 先查 kernel 全局）：
+#   D1_THRESHOLD（2.0）：逻辑回归 logit 的阈值；
+#   候选几何门限（µm）：母→候选 ≤ 12、姐妹间距 ≤ 16、两子中点到母细胞的 flow 预测位置 ≤ 8；
+#   每帧新增分叉 ≤ max(1, round(该帧节点数 × 2%))，每部影片 ≤ max(1, round(边数 × 1%))；图像特征每部影片最多算 30 s。
+# _D1_ACTIVE 是总开关：第一遍 pass 为 False（包装器原样返回安全分裂的结果），只有第 11 段的最终 pass 才打开。
+_D1_ACTIVE = False
+D1_THRESHOLD = 2.0
+D1_MAX_PARENT_UM = 12.0
+D1_MAX_SISTER_UM = 16.0
+D1_MAX_MID_UM = 8.0
+D1_FRAME_FRAC_CAP = 0.02
+D1_GLOBAL_FRAC_CAP = 0.01
+D1_MAX_SECONDS = 30.0
+# DeepCenter 热图缓存从 8 帧放大到 128 帧：打分器要在很多帧上查热图（缺口否决、安全分裂否决也共用这份缓存）。
+# 缓存只影响速度、不影响结果（_dc_cache_trim 在调用时读取这个全局值）。
+DEEPCENTER_SCORE_CACHE_MAX_FRAMES = 128
+# _D1_SHA：下面内嵌源码文本的 sha256 前 16 位，只写进第 11 段的运行报告，用来核对运行的是哪份源码，不参与计算。
+_D1_SHA = 'c45add6e1c02074f'
+# 分裂补全打分器的完整源码以字符串内嵌（与 part2_d1_division_scorer/d1_module.py 逐字相同），
+# 下面 exec 到独立命名空间后安装到 kernel 全局。训练表导出（dump 模式）与推理调用的是同一个 candidates() 特征函数，
+# 特征的定义和实现只有一份。
+_D1_SOURCE = r'''# 分裂补全打分器（推理期模块）
+# 本文件的全文就是第三部分推理脚本中 _D1_SOURCE 字符串的内容（逐字相同）：推理脚本把它 exec 到一个独立命名空间，
+# 再调用 install(globals(), None) 把打分器接到后处理链上。第二部分的训练表导出（step1_build_table.py）用的也是
+# 这同一份代码（dump 模式）。代码行与比赛中实际运行的版本完全一致，这里只加了中文注释和中文文档字符串。
+"""分裂补全打分器：在公开基线的"安全分裂"之后，用一个小型逻辑回归追加分叉（只增不删）。
+
+一、为什么要"学"一个打分器
+  1. 指标 = 调整后的边 Jaccard + 0.1 × 分裂 Jaccard，分裂项只认出度 ≥ 2 的预测节点（分叉）。ILP 本身允许一个
+     母细胞接两个子细胞，但后处理的运动重链接用匈牙利算法做一对一分配，并（正常情况下）替换掉全部 ILP 边，所以
+     重链接之后的图里没有分叉，分叉只能靠后面的分裂阶段补。训练集 199 段影像一共只有 151 次 GT 分裂；分裂项的
+     权重虽然只有 0.1，但每一次都很值钱：样本内多做对一次分裂约 +0.00056，多一个假分叉只扣约 0.00007，
+     盈亏平衡精度只要约 10%，所以宁可多试。
+  2. 公开基线只在 add_safe_divisions_postlink 里用一串手工门限产生分叉（最近邻、两个子细胞各恰有一个后继时的
+     继续分开、对称、DeepCenter 否决、数量上限），样本内 151 次分裂只做对 23 次；放宽门限又会让假分叉暴增——
+     普通步长与分裂步长的分布严重重叠，只靠距离挑不出分裂。
+  3. 误差分析：训练影像上漏掉的 128 次 GT 分裂中，有 44 次的第二个子细胞已经在图里，只是一条"没有父亲的轨迹
+     起点"。只要补一条"母细胞 → 第二个子细胞"的边，就恢复了一次分裂。问题因此变成：对每个 (P, A, B) 三元组
+     做二分类，判断它是不是一次真分裂。
+
+二、候选三元组（candidates）
+  P = t 帧中恰有一个子节点 A（在 t+1 帧）的节点；B = t+1 帧中没有父亲的节点（轨迹起点）。
+  三道宽松的几何门限（µm）：|P − B| ≤ 12，|A − B| ≤ 16，A 与 B 的中点到 P 的预测位置 ≤ 8。
+  预测位置 = P + 局部 flow（当前图中 t→t+1、离 P 最近的 12 条边位移的中位数），即"P 若不分裂，下一帧应在哪里"。
+  门限只负责缩小候选集，真正的判断交给模型。训练影像上候选能覆盖 151 次分裂中的 46 次，这就是打分器的上限。
+
+三、31 维特征（4 组）
+  几何 10 个：P–B 距离 d_pb、P–A 距离 d_pa、A–B 距离 d_ab、A 到预测点距离 r_a、B 到预测点距离 r_b、
+             中点到预测点距离 mid、A/B 偏移夹角余弦 cos、A–B 深度差 dz_ab、偏移不对称度 sym、局部 flow 幅度 flow
+  轨迹 12 个：1/2/3 帧后分离增量 div1/div2/div3、1/2/3 帧后分离缺失 div1_miss/div2_miss/div3_miss、
+             B 后续轨迹长度 b_fwd、A 后续轨迹长度 a_fwd、P 之前轨迹长度 p_back、B 是 A 最近无父起点 mutual_nn、
+             附近无父起点数 n_unclaimed10、附近节点数 n_nodes10
+  DeepCenter 中心先验 3 个：B 处中心先验 dc_b、A 处中心先验 dc_a、P 处中心先验 dc_p
+  亮度 6 个：B 亮度对比 c_b、A 亮度对比 c_a、P 亮度对比 c_p、P 原位下一帧对比 c_next、P 原位亮度变化 drop_next、
+             A、B 亮度差异 ratio_ba
+  直觉：两个子细胞应大致对称地分居预测点两侧、之后继续分开；B 处应确有一个细胞（中心先验高）；母细胞原来的位置
+  在下一帧会变暗，因为它已一分为二并离开了原位。（可选的第 5 组"链接概率"只在 dump 模式下记录，部署的模型不用。）
+
+四、打分与阈值
+  特征先截断到训练集的 0.5% / 99.5% 分位 [lo, hi]，再标准化 (x − mu) / sd，与权重 w 点乘再加偏置 b，得到 logit。
+  logit ≥ 2.0 的候选进入补边队列。训练时正例加了权，logit 不是校准过的概率；2.0 是按官方指标扫描选出的排序阈值。
+
+五、惰性 DeepCenter（精确）与时间预算（不精确）
+  DeepCenter 热图每帧要跑一次 3D 网络，是最贵的一步。logit 对截断后的特征是线性的，把 3 个 DeepCenter 特征代入
+  "最有利值"（权重为正取 hi、为负取 lo）就得到 logit 的严格上界；连上界都过不了阈值的候选不查热图。
+  被打分的集合与全量计算完全相同，训练影像上只有约 4% 的候选需要查热图。
+  另有每部影片 30 s 的图像特征时间预算：超时后剩下的候选不再打分。这一步不精确——机器很慢时输出会与全量计算
+  不同；它只是防止个别影片拖垮 12 小时总时限的保险（可见集上整个打分阶段每部影片约 10～14 s，低于预算）。
+
+六、补边规则
+  按 logit 从高到低贪心补 P → B：每个母细胞、每个起点只用一次；B 不能已有父亲；P 的出度必须恰为 1。
+  每帧最多 max(1, round(该帧节点数 × 2%)) 个、每部影片最多 max(1, round(边数 × 1%)) 个新分叉。
+  公开基线自己的分叉一个不删。容错：任何异常都返回安全分裂阶段的结果，提交不受影响。
+
+七、dump 模式（导出训练表）
+  kernel 全局变量 D1_DUMP 是一个列表时，只把全部候选及其全部特征追加进列表、不改图（不用惰性上界，也不受时间
+  预算限制）。训练表就是这样在训练影像上导出的，所以训练与推理共用同一个特征函数：特征的定义和实现只有一份，
+  不会因为训练、推理各写一套代码而产生偏差。
+  注意：stage 先检查开关 _D1_ACTIVE，所以 dump 模式同样要求 kernel 全局变量 _D1_ACTIVE 为真，否则列表保持为空。
+"""
+from __future__ import annotations
+
+import time
+
+# 元数据：NAME（模块的版本标签）、DESCRIPTION、STATS_KEYS 只供记录和离线评估工具使用，kernel 不读取。
+# STATS_KEYS 列出本模块写进每部影片统计表（run_stats.csv）的计数字段，便于检查打分器在每部影片上做了什么：
+#   m_d1_sources 母细胞数、m_d1_candidates 候选数、m_d1_heat_candidates 真正查了热图的候选数、
+#   m_d1_time_skipped 因超时未打分的候选数、m_d1_scored 过阈值的候选数、m_d1_added 实际补上的分叉数、
+#   m_d1_cap_skipped 因上限被跳过的候选数、m_d1_errors 出错次数、m_d1_seconds 用时。
+NAME = "d1_pw10c_final"
+DESCRIPTION = "Learned division scorer (geometry + track + image features), adds forks after the kernel's safe divisions."
+STATS_KEYS = ["m_d1_sources", "m_d1_candidates", "m_d1_scored", "m_d1_added", "m_d1_cap_skipped", "m_d1_errors", "m_d1_seconds",
+              "m_d1_heat_candidates", "m_d1_time_skipped"]
+
+# 默认参数。kernel 全局里若有同名变量（推理脚本第 5 段在内嵌本源码之前定义了 D1_THRESHOLD 等），以全局值为准（见 _knobs）。
+DEFAULTS = {
+    # 门限 1：母细胞 P → 候选 B 的原始距离（不扣除 flow）不超过 12 µm。
+    # 分裂的母→子步长本来就大（90% 分位约 9 µm），所以比普通链接放得宽。
+    "D1_MAX_PARENT_UM": 12.0,     # candidate generation: mother -> candidate, raw
+    # 门限 2：现有子细胞 A 与候选 B 的最大间距（姐妹间距）16 µm；姐妹间距的中位数约 10.6 µm。
+    "D1_MAX_SISTER_UM": 16.0,     # existing child -> candidate
+    # 门限 3：两个子细胞的中点到 P 的 flow 预测位置的最大距离 8 µm。
+    "D1_MAX_MID_UM": 8.0,         # midpoint of the daughters against the mother's flow-predicted position
+    # 逻辑回归 logit 的阈值。
+    "D1_THRESHOLD": 2.0,          # on the model's logit
+    # 每帧新增分叉上限的比例。注意：代码（stage 中的 sources_per_frame）统计的是该帧的全部节点数，
+    # 不只是母细胞候选，右侧英文注释写的 "sources" 不准确，以代码为准。
+    "D1_FRAME_FRAC_CAP": 0.02,    # new forks per frame, fraction of the sources of the frame
+    # 每部影片新增分叉上限 = 边数 × 1%。
+    "D1_GLOBAL_FRAC_CAP": 0.01,   # new forks per movie, fraction of the edges
+    # 局部 flow 取最近 12 条边；轨迹长度类特征（b_fwd、a_fwd、p_back）封顶 6 帧。
+    "D1_FLOW_K": 12,
+    "D1_LIFE_CAP": 6,
+    # 每部影片计算图像特征的时间预算 30 s；超时后剩下的候选不打分。
+    "D1_MAX_SECONDS": 30.0,       # budget per movie for the image features; candidates after it are not scored
+}
+
+# MODEL 由第二部分的训练脚本 step2_train_d1.py 生成（它输出的就是下面这个字典字面量）。训练方法：
+#   每个特征按训练表的 0.5% / 99.5% 分位数截断（lo / hi），再标准化（mu / sd，sd 下限 1e-3）；
+#   类别极不平衡（约 6,760 行候选里只有 46 个正例，另有 33 个含糊行不参与拟合），所以正例按"负例数 / 正例数"加权；
+#   L2 正则系数 10（只罚权重、不罚截距），用 L-BFGS-B 最小化加权对数损失。
+#   正例 = 母细胞的 GT 节点确实分裂，且 B 匹配到它的某个 GT 子细胞；紧挨 GT 分裂却不是正例的候选，
+#   因为指标允许早或晚 1 帧而标签含糊，不参与拟合。
+#   部署的这组系数拟合自比赛中较早一版管线导出的训练表（当时用公开坐标头；候选概率重链接用未经关联特征修正的
+#   概率；没有找回概率打分；找回阈值 0.965；ILP 分裂权重为公开基线的取值，部署时为 0.4）。特征函数与现在完全相同，只是输入的图略有差别，所以用最终管线
+#   重新导出训练表再拟合，得到的系数会有小幅差异，这是正常的。
+# 为什么用逻辑回归：正例只有几十个，复杂模型很容易过拟合；线性模型的权重可以逐个检查符号是否符合生物学直觉，
+#   例如 偏移不对称度 sym 为负、A–B 距离 d_ab 为正、B 处中心先验 dc_b 为正、P–A 距离 d_pa 为负。
+# 打分只用 features / lo / hi / mu / sd / w / b；tables / groups / l2 / note 只记录训练配置（训练表名、特征组、
+#   正则系数、备注）。
+# MODEL_CV 供离线跨胚胎验证使用：以影片名前 4 个字符（胚胎编号）为键，该胚胎的影片由"没见过这个胚胎"的模型打分；
+#   部署版为空字典，所有影片都用 MODEL。
+MODEL = {"features": ["d_pb", "d_pa", "d_ab", "r_a", "r_b", "mid", "cos", "dz_ab", "sym", "flow", "div1", "div1_miss", "div2", "div2_miss", "div3", "div3_miss", "b_fwd", "a_fwd", "p_back", "mutual_nn", "n_unclaimed10", "n_nodes10", "dc_b", "dc_a", "dc_p", "c_b", "c_a", "c_p", "c_next", "drop_next", "ratio_ba"], "lo": [2.448793, 0.046345, 3.542905, 0.0343, 2.952938, 0.73338, -0.995011, 0.019889, 0.111989, 0.02772, -3.402026, 0.0, -4.000569, 0.0, -4.658971, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.001126, 0.005726, 0.005452, 0.000852, 0.021582, 0.024178, -0.620013, -1.3265, 0.0012], "hi": [11.977296, 10.485302, 15.526533, 6.561809, 14.852751, 7.762169, 0.986574, 13.185784, 1.984885, 9.152932, 6.408745, 1.0, 8.392196, 1.0, 10.320039, 1.0, 6.0, 6.0, 6.0, 1.0, 2.0, 7.0, 0.506047, 0.531592, 0.5339, 1.113205, 1.213366, 1.160295, 0.96956, 0.2097, 1.543474], "mu": [8.889406, 2.595021, 9.797805, 1.580937, 9.37478, 4.628661, -0.131946, 4.984972, 1.419937, 1.928905, 0.601882, 0.03761, 1.062762, 0.058124, 1.395041, 0.07849, 5.535603, 5.59447, 5.057083, 0.907091, 0.659283, 3.044894, 0.189169, 0.274468, 0.273868, 0.275767, 0.346952, 0.348286, 0.220021, -0.128616, 0.276579], "sd": [2.244214, 1.865648, 2.400534, 1.199692, 2.424355, 1.423947, 0.581777, 3.194513, 0.402842, 1.632958, 1.502838, 0.19025, 2.048998, 0.233978, 2.478845, 0.268941, 1.216507, 1.201166, 1.752065, 0.290305, 0.582827, 1.436037, 0.121271, 0.13196, 0.132238, 0.202048, 0.236264, 0.23226, 0.231756, 0.219304, 0.289671], "w": [-0.558303, -1.779386, 1.738813, 0.325492, 0.606021, -1.341639, 0.147214, 0.135142, -1.798294, -0.341071, 1.367594, -0.173286, 0.500037, -1.319845, -0.013831, 0.305234, -0.636592, -1.230608, -0.518446, -0.041567, -0.120584, -0.407722, 1.410103, -0.598574, 0.760385, -0.043112, 0.761937, -0.053072, -0.69009, -0.622365, -0.678791], "b": -8.195921, "tables": ["pubw"], "groups": ["geo", "track", "dc", "int"], "l2": 10.0, "note": "trained on all rows"}
+MODEL_CV = {}
+
+# 特征分组（每个特征的中文名见模块文档字符串）。部署的 MODEL 用几何 + 轨迹 + DeepCenter + 亮度共 31 维。
+# FEATURES_PROB（关联模型给出的链接概率）刻意不用：公开权重（检测 + 关联网络）就是在这些训练影像上训练的，样本内的链接概率被
+#   "记住"了、过于自信，泛化到新胚胎时不可靠。dump 模式仍会记录这 4 个特征，便于分析。
+FEATURES_GEO = ["d_pb", "d_pa", "d_ab", "r_a", "r_b", "mid", "cos", "dz_ab", "sym", "flow"]
+FEATURES_TRACK = ["div1", "div1_miss", "div2", "div2_miss", "div3", "div3_miss", "b_fwd", "a_fwd", "p_back", "mutual_nn",
+                  "n_unclaimed10", "n_nodes10"]
+FEATURES_DC = ["dc_b", "dc_a", "dc_p"]
+FEATURES_INT = ["c_b", "c_a", "c_p", "c_next", "drop_next", "ratio_ba"]
+FEATURES_PROB = ["p", "a_p", "p_best_other", "p_margin"]
+
+
+# 参数读取：kernel 全局（ns）里有同名变量且不为 None 时用全局值，否则用 DEFAULTS。
+# 这样调参只需在推理脚本里改一行全局变量，不必改这份内嵌源码。
+def _knobs(ns):
+    return {k: (ns[k] if ns.get(k) is not None else v) for k, v in DEFAULTS.items()}
+
+
+def candidates(ns, nodes_by_id, edges, dataset, bundle, frame_cache, dc_cache, stats, probs=None, with_image=True,
+               lazy=None):
+    """生成全部候选三元组 (母细胞 P, 现有子细胞 A, 无父起点 B)，并计算它们的特征。
+
+    返回列表，每个元素是 {"P", "A", "B", "t", "feat"}，按帧号排序。
+    lazy = (model, threshold) 时启用"惰性 DeepCenter"：热图是最贵的部分（每帧一次网络前向）。若把 DeepCenter 特征
+    换成最有利的取值，logit 仍到不了阈值，这个候选就不查热图，并标记 c["out"] = True。被打分的集合与全量计算完全相同。
+    lazy = None（dump 模式）时每个候选都计算全部特征。
+    """
+    # 本模块通过 exec 运行在独立命名空间里，numpy、cKDTree、读帧函数、DeepCenter 打分函数都从 kernel 全局 ns 中取，
+    # 保证与后处理其他部分用的是同一份实现（例如 read_test_frame 读的就是 kernel 的 TEST_DIR）。
+    np = ns["np"]
+    cKDTree = ns["cKDTree"]
+    knob = _knobs(ns)
+    scale = np.array(ns["VOXEL_SCALE_UM"], dtype=np.float64)
+    life = int(knob["D1_LIFE_CAP"])
+
+    # 坐标换算：节点坐标是原始体素索引 (z, y, x)，乘 VOXEL_SCALE_UM（z 1.625 µm，y/x 0.40625 µm）变成 µm。
+    # z 方向的体素比 y/x 粗 4 倍，所有距离都必须在 µm 下比较。children / parent 来自当前图（已含安全分裂补的边）。
+    ids = sorted(nodes_by_id)
+    vox = {i: (float(nodes_by_id[i]["z"]), float(nodes_by_id[i]["y"]), float(nodes_by_id[i]["x"])) for i in ids}
+    pos = {i: np.array(vox[i]) * scale for i in ids}
+    t_of = {i: int(nodes_by_id[i]["t"]) for i in ids}
+    children, parent = {}, {}
+    for e in edges:
+        s, g = int(e["source_id"]), int(e["target_id"])
+        if s in pos and g in pos:
+            children.setdefault(s, []).append(g)
+            parent[g] = s
+    ids_by_t = {}
+    for i in ids:
+        ids_by_t.setdefault(t_of[i], []).append(i)
+
+    # 局部运动场：对每个 t，收集当前图中全部 t→t+1 边的位移（P→A 自己也在其中）；至少 4 条边才建场，否则 flow = 0。
+    # flow(t, 点) = 起点离该点最近的 12 条边的位移，逐轴取中位数。胚胎里的细胞成片协同运动，邻居位移的中位数比单个位移稳健，
+    # 少数错连的边也带不偏它。P + flow 就是"P 若不分裂，下一帧应在的位置"（下文称预测点）。
+    field = {}
+    for t, frame_ids in ids_by_t.items():
+        src, disp = [], []
+        for i in frame_ids:
+            for g in children.get(i, []):
+                if t_of[g] == t + 1:
+                    src.append(pos[i])
+                    disp.append(pos[g] - pos[i])
+        if len(src) >= 4:
+            field[t] = (cKDTree(np.stack(src)), np.stack(disp))
+
+    def flow(t, point):
+        if t not in field:
+            return np.zeros(3)
+        tree, disp = field[t]
+        _d, idx = tree.query(point, k=min(int(knob["D1_FLOW_K"]), len(disp)))
+        return np.median(disp[np.atleast_1d(idx)], axis=0)
+
+    # 轨迹辅助函数：
+    #   descendant(i, k)：沿"唯一子节点"链走 k 步，途中断开或分叉就返回 None（用于分离增量 div_k）；
+    #   forward(i)：从 i 沿唯一子节点链往后能走几帧，封顶 6；backward(i)：沿父节点链往前能走几帧，封顶 6。
+    # 轨迹长短反映可信度：长期被追踪的母细胞和能延续下去的子细胞更可能是真的，极短的残片多是假检测或断裂碎片。
+    def descendant(i, k):
+        for _ in range(k):
+            nxt = children.get(i, [])
+            if len(nxt) != 1:
+                return None
+            i = nxt[0]
+        return i
+
+    def forward(i):
+        n = 0
+        while n < life and len(children.get(i, [])) == 1:
+            i = children[i][0]
+            n += 1
+        return n
+
+    def backward(i):
+        n = 0
+        while n < life and i in parent:
+            i = parent[i]
+            n += 1
+        return n
+
+    # DeepCenter 中心先验：独立训练的公开 3D U-Net 输出"细胞中心"热图（在 xy 池化后的网格上），
+    # 取该点周围 z±1、池化网格 y/x±2 小窗内的最大值。没有加载 DeepCenter 时返回 −1（之后取 max(0, ·) 变成 0）。
+    def dc(t, v):
+        if bundle is None:
+            return -1.0
+        value = ns["deepcenter_score_point"](dataset, int(t), v, bundle, frame_cache, dc_cache)
+        return -1.0 if value is None else float(value)
+
+    # 局部亮度：小框（z±1、y/x±4 原始体素，约 4.9×3.7×3.7 µm，大致一个细胞核）的均值，
+    # 和大框（z±3、y/x±12，约 11.4×10.2×10.2 µm，代表局部背景）的中位数；两者都至少取 1，防止 log(0)。
+    # 后面用两者的对数比当"对比度"：除以局部背景，消除不同影像、不同深度整体亮度的差异。
+    def intensity(t, v):
+        frame = ns["read_test_frame"](dataset, int(t), frame_cache)
+        z, y, x = int(round(v[0])), int(round(v[1])), int(round(v[2]))
+        patch = frame[max(0, z - 1):z + 2, max(0, y - 4):y + 5, max(0, x - 4):x + 5]
+        wide = frame[max(0, z - 3):z + 4, max(0, y - 12):y + 13, max(0, x - 12):x + 13]
+        if patch.size == 0 or wide.size == 0:
+            return 1.0, 1.0
+        return max(float(patch.mean()), 1.0), max(float(np.median(wide)), 1.0)
+
+    # by_target：每个目标节点收到的全部 (概率, 源) 列表，只用于可选的链接概率特征（dump 模式记录，部署模型不用）。
+    by_target = {}
+    if probs:
+        for (s, g), p in probs.items():
+            if p is None:
+                continue
+            cur = by_target.get(g)
+            if cur is None:
+                by_target[g] = [(float(p), s)]
+            else:
+                cur.append((float(p), s))
+
+    # ---- 候选生成 ----
+    # 对每个 t：B 取 t+1 帧全部无父节点（轨迹起点）；P 取 t 帧中恰有一个子节点、且子节点在 t+1 帧的节点。
+    # 已经有两个子节点的母细胞（例如公开基线刚补上分叉的）不再参与：每个母细胞最多补一个第二子细胞。
+    out = []
+    n_sources = 0
+    for t in sorted(ids_by_t):
+        next_ids = ids_by_t.get(t + 1)
+        if not next_ids:
+            continue
+        starts = [i for i in next_ids if i not in parent]
+        if not starts:
+            continue
+        start_arr = np.stack([pos[i] for i in starts])
+        start_tree = cKDTree(start_arr)
+        next_tree = cKDTree(np.stack([pos[i] for i in next_ids]))
+        sources = [i for i in ids_by_t[t] if len(children.get(i, [])) == 1 and t_of[children[i][0]] == t + 1]
+        n_sources += len(sources)
+        if not sources:
+            continue
+        # 门限 1：|P − B| ≤ 12 µm（对全部无父起点做 KD 树球查询）。
+        near = start_tree.query_ball_point(np.stack([pos[i] for i in sources]), r=float(knob["D1_MAX_PARENT_UM"]))
+        for P, hits in zip(sources, near):
+            if not hits:
+                continue
+            A = children[P][0]
+            # 预测点 = P + 局部 flow；r_a = A 相对预测点的残差向量。
+            f = flow(t, pos[P])
+            predicted = pos[P] + f
+            ra = pos[A] - predicted
+            na = float(np.linalg.norm(ra))
+            d_pa = float(np.linalg.norm(pos[A] - pos[P]))
+            nn_of_a = None
+            for j in hits:
+                B = starts[j]
+                # 门限 2：姐妹间距 |A − B| ≤ 16 µm；门限 3：A、B 的中点到预测点 ≤ 8 µm——
+                # 真分裂时两个子细胞对称地落在"母细胞本应到达的位置"两侧，中点应贴近预测点。
+                d_ab = float(np.linalg.norm(pos[A] - pos[B]))
+                if d_ab > float(knob["D1_MAX_SISTER_UM"]):
+                    continue
+                mid = float(np.linalg.norm((pos[A] + pos[B]) / 2.0 - predicted))
+                if mid > float(knob["D1_MAX_MID_UM"]):
+                    continue
+                rb = pos[B] - predicted
+                nb = float(np.linalg.norm(rb))
+                # mutual_nn 用：t+1 帧全部无父起点中离 A 最近的那个（每个 P 只查一次）。
+                if nn_of_a is None:
+                    _d, k = start_tree.query(pos[A])
+                    nn_of_a = starts[int(k)]
+                # ---- 几何特征（10 个，距离单位 µm）----
+                # d_pb / d_pa / d_ab：三边长；r_a / r_b：A、B 到预测点的距离；mid：中点到预测点的距离；
+                # cos：残差向量 (A − 预测点) 与 (B − 预测点) 的夹角余弦，真分裂两子分居两侧，cos 接近 −1；
+                #   （cos 其实可由 r_a、r_b、mid 推出：4·mid² = r_a² + r_b² + 2·r_a·r_b·cos，信息与它们重复；模型里它的权重也很小）；
+                # dz_ab：两子的 z 差；sym = |r_a − r_b| / max((r_a + r_b)/2, 0.5)：两子离预测点是否一样远（0.5 µm 是防除零的下限）；
+                # flow：局部整体运动的幅度（运动快的区域，各种距离本身就偏大，模型需要知道这一点）。
+                # ---- 轨迹特征（这里 6 个，div_k 在下面）----
+                # b_fwd / a_fwd：B、A 往后的轨迹长度；p_back：P 往前的轨迹长度（都封顶 6 帧）；
+                # mutual_nn：离 A 最近的无父起点是否就是 B（只检查 A→起点这一个方向）；
+                # n_unclaimed10：预测点 10 µm 内的无父起点数（封顶 10）；n_nodes10：预测点 10 µm 内 t+1 帧的全部节点数（封顶 15）
+                #   ——越拥挤越容易配错。
+                feat = {
+                    "d_pb": float(np.linalg.norm(pos[B] - pos[P])), "d_pa": d_pa, "d_ab": d_ab, "r_a": na, "r_b": nb, "mid": mid,
+                    "cos": float(np.dot(ra, rb) / max(na * nb, 1e-6)), "dz_ab": float(abs(pos[A][0] - pos[B][0])),
+                    "sym": abs(na - nb) / max((na + nb) / 2.0, 0.5), "flow": float(np.linalg.norm(f)),
+                    "b_fwd": float(forward(B)), "a_fwd": float(forward(A)), "p_back": float(backward(P)),
+                    "mutual_nn": float(nn_of_a == B),
+                    "n_unclaimed10": float(min(len(start_tree.query_ball_point(predicted, 10.0)), 10)),
+                    "n_nodes10": float(min(len(next_tree.query_ball_point(predicted, 10.0)), 15)),
+                }
+                # 分离增量 div_k（k = 1、2、3）：A、B 各沿唯一子节点链再走 k 帧后的间距，减去当前姐妹间距，截断到 [−10, 15] µm。
+                # 分裂后两个子细胞会持续远离（div_k > 0）；检测抖动造成的"假姐妹"不会系统性地分开。
+                # 链在途中断开或再分叉时记 div_k = 0、div_k_miss = 1，让模型单独学习"缺失"本身意味着什么。
+                for k in (1, 2, 3):
+                    da, db = descendant(A, k), descendant(B, k)
+                    if da is None or db is None:
+                        feat[f"div{k}"], feat[f"div{k}_miss"] = 0.0, 1.0
+                    else:
+                        feat[f"div{k}"] = float(np.clip(np.linalg.norm(pos[da] - pos[db]) - d_ab, -10.0, 15.0))
+                        feat[f"div{k}_miss"] = 0.0
+                # 可选的链接概率特征：p = P→B 的概率，a_p = P→A 的概率，p_best_other = 其他源指向 B 的最大概率，p_margin = 两者之差。
+                if probs is not None:
+                    p = float(probs.get((P, B), 0.0) or 0.0)
+                    others = [pp for pp, ss in by_target.get(B, []) if ss != P]
+                    best_other = max(others, default=0.0)
+                    feat.update({"p": p, "a_p": float(probs.get((P, A), 0.0) or 0.0), "p_best_other": best_other,
+                                 "p_margin": p - best_other})
+                out.append({"P": int(P), "A": int(A), "B": int(B), "t": int(t), "feat": feat})
+
+    # ---- 图像特征（亮度 6 个 + DeepCenter 3 个）：全部候选生成之后再算 ----
+    # 惰性 DeepCenter 的上界：对每个 DeepCenter 特征，权重为正取上界 hi、为负取下界 lo，即"最有利值"（best_case）。
+    # 打分时特征会先截断到 [lo, hi] 再线性组合，所以代入最有利值得到的就是 logit 在任何热图取值下的严格上界；
+    # 上界仍低于阈值的候选，无论热图是多少都不会被选中，跳过热图查询不改变结果（精确）。
+    if with_image:
+        best_case = None
+        if lazy is not None:
+            model, threshold = lazy
+            index = {name: k for k, name in enumerate(model["features"])}
+            best_case = {}
+            for name in FEATURES_DC:
+                if name in index:
+                    k = index[name]
+                    best_case[name] = float(model["hi"][k]) if float(model["w"][k]) > 0 else float(model["lo"][k])
+        # 时间预算：从这里开始计时，超过 30 s 后剩下的候选直接标记 out、不再打分。这一步不精确（机器慢时结果会变），
+        # 只是防止个别影片候选过多拖垮总时限的保险。dump 模式（lazy = None）不受预算限制，每个候选都算全部特征。
+        # 候选按帧号顺序处理，原始帧缓存和热图缓存只需保留最近几帧（右侧英文注释的意思）。
+        started = time.time()
+        budget = float(knob["D1_MAX_SECONDS"])
+        n_heat = n_late = 0
+        for c in out:                     # ordered by frame: the frame and heat-map caches stay small
+            feat, t = c["feat"], c["t"]
+            vp, va, vb = vox[c["P"]], vox[c["A"]], vox[c["B"]]
+            if lazy is not None and time.time() - started > budget:
+                c["out"] = True
+                n_late += 1
+                continue
+            # 亮度特征（都是对数比，并截断到固定范围，防止极端值主导）：
+            #   c_b / c_a / c_p：B、A（t+1 帧）和 P（t 帧）相对局部背景的对比度——这里是否真有一个细胞核；
+            #   c_next：t+1 帧 P 原位置的亮度相对 t 帧 P 的局部背景；drop_next：P 原位置从 t 到 t+1 的亮度变化——
+            #     分裂后两个子细胞向两侧移开，母细胞原来的位置在下一帧会变暗；
+            #   ratio_ba：两个子细胞的亮度差异，一分为二的姐妹细胞亮度相近。
+            ib, bb = intensity(t + 1, vb)
+            ia, ba = intensity(t + 1, va)
+            ip, bp = intensity(t, vp)
+            inext, _ = intensity(t + 1, vp)
+            feat["c_b"] = float(np.clip(np.log(ib / bb), -2, 3))
+            feat["c_a"] = float(np.clip(np.log(ia / ba), -2, 3))
+            feat["c_p"] = float(np.clip(np.log(ip / bp), -2, 3))
+            feat["c_next"] = float(np.clip(np.log(inext / bp), -2, 3))
+            feat["drop_next"] = float(np.clip(np.log(inext / ip), -3, 2))
+            feat["ratio_ba"] = float(np.clip(abs(np.log(ib / ia)), 0, 3))
+            # 先用便宜的特征 + DeepCenter 最有利值算 logit 上界；过不了阈值就不查热图。
+            if best_case is not None:
+                if logit(model, {**feat, **best_case}, np) < threshold:
+                    c["out"] = True
+                    continue
+            # 可能过阈值的候选才真正查 3 次热图：B、A 在 t+1 帧，P 在 t 帧；热图缺失时为 −1，取 max(0, ·)。
+            n_heat += 1
+            feat["dc_b"], feat["dc_a"], feat["dc_p"] = (max(0.0, dc(t + 1, vb)), max(0.0, dc(t + 1, va)), max(0.0, dc(t, vp)))
+        stats["m_d1_heat_candidates"] = n_heat
+        stats["m_d1_time_skipped"] = n_late
+    stats["m_d1_sources"] = n_sources
+    stats["m_d1_candidates"] = len(out)
+    return out
+
+
+# 打分：特征按 MODEL["features"] 的顺序排成向量 → 截断到 [lo, hi] → 标准化 (x − mu) / sd → 与 w 点乘再加 b，得到 logit。
+# 截断让少数极端值不主导模型，也给每个特征确定的上下界——上面的惰性上界正是利用了这一点。
+def logit(model, feat, np):
+    x = np.array([float(feat[name]) for name in model["features"]], dtype=np.float64)
+    lo, hi = np.asarray(model["lo"], dtype=np.float64), np.asarray(model["hi"], dtype=np.float64)
+    x = np.clip(x, lo, hi)
+    return float(((x - np.asarray(model["mu"])) / np.asarray(model["sd"])) @ np.asarray(model["w"]) + float(model["b"]))
+
+
+# 安装：把 kernel 全局的 add_safe_divisions_postlink 换成包装器 stage，motion_relink_edges 换成 relink_keeping_probs。
+# 后处理总链 filter_output_graph 在调用时按全局名字查找这两个函数，所以替换后每一遍后处理都会经过包装器。
+# 参数 source_of 未使用。
+def install(ns, source_of):
+    base_stage = ns["add_safe_divisions_postlink"]
+    base_relink = ns["motion_relink_edges"]
+    held = {"probs": None}
+
+    # 透明包装：先记下重链接用到的链接概率字典，再原样调用原函数，结果不变。只有 dump 模式（记录概率特征）用得到；
+    # 找回补进了节点时会再重链接一次，held 里留下的是最后一次调用的概率。
+    def relink_keeping_probs(nodes_by_id, stats, learned_edge_probs=None):
+        held["probs"] = learned_edge_probs
+        return base_relink(nodes_by_id, stats, learned_edge_probs)
+
+    # 包装后的分裂阶段：
+    #   1. 先运行公开基线自带的安全分裂（手工门限），它补的分叉一个都不删；
+    #   2. 只有 kernel 全局 _D1_ACTIVE 为真（最终 pass）时才继续，dump 模式同样要求它为真；
+    #   3. 在安全分裂之后的图上生成候选、打分、贪心补边。
+    def stage(nodes_by_id, edges, stats, dataset=None, deepcenter_bundle=None, frame_cache=None, deepcenter_cache=None):
+        out = base_stage(nodes_by_id, edges, stats, dataset=dataset, deepcenter_bundle=deepcenter_bundle,
+                         frame_cache=frame_cache, deepcenter_cache=deepcenter_cache)
+        # D1_DUMP 为列表即 dump 模式；MODEL_CV 为空，所以 model 总是 MODEL。
+        dump = ns.get("D1_DUMP")
+        model = MODEL_CV.get(str(dataset)[:4], MODEL) if dataset else MODEL
+        # 开关：推理脚本定义了 _D1_ACTIVE（默认 False），因此只看它；_G1X1_ACTIVE 只是没定义 _D1_ACTIVE 时的后备。
+        # 没有影片名或图里没有边时也直接返回。
+        if not ns.get("_D1_ACTIVE", ns.get("_G1X1_ACTIVE", False)) or not dataset or not out:
+            return out
+        if dump is None and model is None:
+            return out
+        # 下面整个过程包在 try 里：任何异常都只记一次 m_d1_errors，并返回安全分裂的结果，保证提交不受影响。
+        started = time.time()
+        try:
+            np = ns["np"]
+            knob = _knobs(ns)
+            frame_cache = frame_cache if frame_cache is not None else {}
+            deepcenter_cache = deepcenter_cache if deepcenter_cache is not None else {}
+            # dump 模式：全部特征都算（含链接概率），不用惰性上界和时间预算，保证训练表的每一行都完整。
+            # 打分模式：部署模型不含概率特征（need_prob 为假），含图像特征（need_image 为真），启用惰性上界。
+            need_prob = dump is not None or any(name in FEATURES_PROB for name in model["features"])
+            need_image = dump is not None or any(name in FEATURES_DC + FEATURES_INT for name in model["features"])
+            cands = candidates(ns, nodes_by_id, out, dataset, deepcenter_bundle, frame_cache, deepcenter_cache, stats,
+                               probs=held["probs"] if need_prob else None, with_image=need_image,
+                               lazy=None if dump is not None or not need_image else (model, float(knob["D1_THRESHOLD"])))
+            # dump 模式：只把候选及特征追加到列表、不改图。训练表就是这样在训练影像上导出的。
+            if dump is not None:
+                dump.extend(cands)
+                return out
+            # 打分：跳过被惰性上界或时间预算标记为 out 的候选，其余 logit ≥ 2.0 的进入队列。
+            # 阈值 2.0 来自官方指标的阈值扫描（1～2 之间最优，曲线平坦）；正例加了权，它不对应校准概率 sigmoid(2) ≈ 0.88。
+            scored = []
+            for c in cands:
+                if c.get("out"):
+                    continue
+                value = logit(model, c["feat"], np)
+                if value >= float(knob["D1_THRESHOLD"]):
+                    scored.append((value, c))
+            stats["m_d1_scored"] = len(scored)
+            # 按 logit 从高到低排序，同分时按 P、B 编号排序，保证结果可复现。
+            scored.sort(key=lambda item: (-item[0], item[1]["P"], item[1]["B"]))
+            # 上限：每帧 max(1, round(该帧全部节点数 × 2%))——变量名叫 sources_per_frame，实际统计的是该帧全部节点；
+            # 每部影片 max(1, round(边数 × 1%))。防止模型在个别碎片化的影片上系统性出错时一次加入大量假分叉。
+            sources_per_frame = {}
+            for node in nodes_by_id.values():
+                sources_per_frame[int(node["t"])] = sources_per_frame.get(int(node["t"]), 0) + 1
+            global_cap = max(1, int(round(len(out) * float(knob["D1_GLOBAL_FRAC_CAP"]))))
+            used_sources, used_targets, per_frame = set(), set(), {}
+            has_parent = {int(e["target_id"]) for e in out}
+            out_degree = {}
+            for e in out:
+                out_degree[int(e["source_id"])] = out_degree.get(int(e["source_id"]), 0) + 1
+            added = []
+            skipped = 0
+            # 贪心补边 P → B：每个母细胞、每个起点只用一次；B 不能已有父亲；P 当前出度必须恰为 1（不产生三叉）。
+            # 达到上限的候选只是跳过（continue，不是 break），其他帧的候选仍有机会。
+            # 分裂项对假分叉的惩罚很轻（盈亏平衡精度约 10%），所以阈值和上限都可以相对宽松。
+            for value, c in scored:
+                P, B, t = c["P"], c["B"], c["t"]
+                if P in used_sources or B in used_targets or B in has_parent or out_degree.get(P, 0) != 1:
+                    continue
+                frame_cap = max(1, int(round(sources_per_frame.get(t, 0) * float(knob["D1_FRAME_FRAC_CAP"]))))
+                if len(added) >= global_cap or per_frame.get(t, 0) >= frame_cap:
+                    skipped += 1
+                    continue
+                # 新边不带链接概率（edge_prob = None）；safe_division / d1_division / d1_logit 只是标记，下游不读取。
+                added.append({"source_id": P, "target_id": B, "edge_prob": None, "distance_um": float(c["feat"]["d_pb"]),
+                              "safe_division": 1, "d1_division": 1, "d1_logit": round(value, 3)})
+                used_sources.add(P)
+                used_targets.add(B)
+                per_frame[t] = per_frame.get(t, 0) + 1
+            stats["m_d1_added"] = len(added)
+            stats["m_d1_cap_skipped"] = skipped
+            stats["m_d1_seconds"] = round(time.time() - started, 2)
+            # safe_divisions_added 是安全分裂与打分器补的分叉总数（后处理日志一起打印）。
+            if added:
+                stats["safe_divisions_added"] = int(stats.get("safe_divisions_added", 0)) + len(added)
+                return [*out, *added]
+            return out
+        except Exception as exc:  # noqa: BLE001
+            stats["m_d1_errors"] = stats.get("m_d1_errors", 0) + 1
+            print(f"  [{dataset}] D1 division scorer skipped (non-fatal): {type(exc).__name__}: {exc}")
+            return out
+
+    # 替换 kernel 全局中的两个函数。
+    ns["add_safe_divisions_postlink"] = stage
+    ns["motion_relink_edges"] = relink_keeping_probs
+'''
+# 在独立命名空间中执行内嵌源码（模块名和编译文件名只会出现在报错栈里），再把包装器安装到当前全局命名空间 globals()：
+# add_safe_divisions_postlink 与 motion_relink_edges 被替换。filter_output_graph 在调用时按名字查找这两个函数，
+# 所以之后每一遍后处理都会经过包装器；但只有 _D1_ACTIVE 为真时才追加分叉，第一遍 pass 的结果不受影响。
+_D1_MODULE = {"__name__": "biohub_d1_pw10c_final"}
+exec(compile(_D1_SOURCE, "biohub_d1_pw10c_final", "exec"), _D1_MODULE)
+_D1_MODULE["install"](globals(), None)
+
+
+# 【后处理总链】输入：一部影片的 ILP 原始图——节点 {node_id: {node_id, t, z, y, x}}（原始体素坐标）和带 edge_prob 的边。
+# 执行顺序：
+#   1 边过滤（只留相邻帧、≤ 14 µm 的边）
+#   2 运动重链接：用局部运动预测下一帧位置 + 链接概率，逐帧对做匈牙利一一分配，结果替换全部 ILP 边
+#     （最终 pass 另用候选概率重链接、关联特征修正后的概率和全局位移估计）
+#   3 找回 ILP 丢掉的检测峰，并第二次重链接（最终 pass 还让找回的节点继承链接概率）
+#   4 单父修复（每个节点只留一条入边）
+#   5 单帧缺口闭合 → 6 严格两帧缺口 → 7 低分峰补缺
+#   8 安全分裂 + 分裂补全打分器
+#   9 删孤立节点 → 10 短轨迹过滤 → 11 （跳变感知）线拟合平滑
+# 顺序的道理：先把关联做对（边项是指标主体，漏掉的边多数是"节点都在但连错"）→ 再补断裂（补缺依赖正确的末端和起点）
+# → 再补分裂（分裂判断要看子代后续 1～3 帧，依赖完整、延续的轨迹）→ 删碎片（节点数调整项）→ 最后平滑坐标（只改坐标不改拓扑）。
+# 注意：本函数会修改传入的节点和边（写入 distance_um、加节点、改坐标），调用方需要自己保留副本。
+def filter_output_graph(
+    nodes_by_id: dict[int, dict[str, object]],
+    raw_edges: list[dict[str, object]],
+    dataset: str | None = None,
+    deepcenter_bundle: dict[str, object] | None = None,
+) -> tuple[dict[int, dict[str, object]], list[dict[str, object]], dict[str, int]]:
+    _stage_t0 = _time.time()
+    # 统计字典：其他函数里用 += 累加的键必须先在这里初始化；每部影片一行写进 run_stats.csv，用来排查每个阶段做了什么。
+    stats = {
+        "raw_edges": len(raw_edges),
+        "dropped_nonconsecutive_edges": 0,
+        "dropped_long_edges": 0,
+        "dropped_multi_parent_edges": 0,
+        "dropped_multi_child_edges": 0,
+        "dropped_division_edges": 0,
+        "gap_candidates": 0,
+        "gap_pairs_selected": 0,
+        "gap_reused_existing": 0,
+        "gap_inserted_synthetic": 0,
+        "gap_added_nodes": 0,
+        "gap_added_edges": 0,
+        "gap_skipped_node_cap": 0,
+        "gap_density_nodes_scored": 0,
+        "gap_density_candidates_expanded": 0,
+        "gap_density_candidates_restricted": 0,
+        "gap_density_selected_outside_base": 0,
+        "gap_density_step_delta_milli_sum": 0,
+        "gap_refined_synthetic": 0,
+        "gap_refine_failed": 0,
+        "gap_refine_rejected_shift": 0,
+        "pruned_isolated_nodes": 0,
+        "motion_relink_edges": 0,
+        "motion_relink_tight_edges": 0,
+        "motion_relink_relaxed_edges": 0,
+        "motion_relink_frames": 0,
+        "motion_relink_replaced_raw_edges": 0,
+        "motion_relink_fallback_raw": 0,
+        "motion_relink_skipped_large_frame": 0,
+        "gap2_candidates": 0,
+        "gap2_pairs_selected": 0,
+        "gap2_added_nodes": 0,
+        "gap2_added_edges": 0,
+        "gap2_skipped_cap": 0,
+        "safe_division_candidates": 0,
+        "safe_division_geometric_candidates": 0,  
+        "safe_divisions_added": 0,
+        "safe_division_skipped_cap": 0,
+        "safe_division_mutual_nn_rejected": 0,
+        "safe_division_divergence_rejected": 0,
+        "safe_division_symmetry_rejected": 0,  
+        "deepcenter_gap_checked": 0,
+        "deepcenter_gap_bypassed_strong_motion": 0,
+        "deepcenter_gap_bypassed_observed_node": 0,
+        "deepcenter_gap_accepted": 0,
+        "deepcenter_gap_rejected": 0,
+        "deepcenter_gap_missing": 0,
+        "deepcenter_safe_div_checked": 0,
+        "deepcenter_safe_div_accepted": 0,
+        "deepcenter_safe_div_rejected": 0,
+        "deepcenter_safe_div_missing": 0,
+        "short_track_components_removed": 0,
+        "short_track_nodes_removed": 0,
+        "short_track_edges_removed": 0,
+        "short_track_filter_skipped_all": 0,
+        "short_track_rescue_triggered": 0,
+        "short_track_rescue_components": 0,
+        "short_track_rescue_nodes": 0,
+        "short_track_rescue_budget": 0,
+        "linefit_smoothed_nodes": 0,
+        "linefit_skipped_nodes": 0,
+    }
+
+    # 1 边过滤：丢掉端点缺失、不在相邻帧（提交只计 t → t+1 的边）和超过 14 µm 的边；顺便把 distance_um 写进边。
+    edges: list[dict[str, object]] = []
+    for edge in raw_edges:
+        source = nodes_by_id.get(int(edge["source_id"]))
+        target = nodes_by_id.get(int(edge["target_id"]))
+        if source is None or target is None:
+            continue
+        if OUTPUT_ENFORCE_NEXT_FRAME and int(target["t"]) != int(source["t"]) + 1:
+            stats["dropped_nonconsecutive_edges"] += 1
+            continue
+        distance_um = edge_distance_um(source, target)
+        edge["distance_um"] = distance_um
+        if OUTPUT_EDGE_MAX_UM > 0 and distance_um > OUTPUT_EDGE_MAX_UM:
+            stats["dropped_long_edges"] += 1
+            continue
+        edges.append(edge)
+
+    # 2 运动重链接。先收集 ILP 边的链接概率（同一对取最大值），作为重链接代价中的概率项。
+    if OUTPUT_MOTION_RELINK:
+        learned_edge_probs: dict[tuple[int, int], float] = {}
+        for edge in edges:
+            prob = edge.get("edge_prob")
+            if prob is None:
+                continue
+            try:
+                prob = float(prob)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(prob):
+                key = (int(edge["source_id"]), int(edge["target_id"]))
+                learned_edge_probs[key] = max(learned_edge_probs.get(key, float("-inf")), prob)
+        _dr_raw_keys = set(learned_edge_probs)
+        _dr_initial_node_ids = set(nodes_by_id)
+        # 候选概率重链接（仅最终 pass）：读入第 4 段预测时导出的稠密候选缓存——相距 ≤ 10 µm 的全部候选对，再加上每个目标
+        # 概率最高的 12 个源（打开关联特征修正时读 d4_prob），让不在 ILP 解里的候选对也有概率可用（公开基线里它们的 p 一律为 0）。
+        # 缓存目录名必须与第 4 段的补丁、第 11 段的统计代码一致，不能单独改名。
+        # 覆盖率守卫：≤ 9.9 µm 的 ILP 边至少 90% 要在缓存里，否则说明节点编号对不上，主动报错，交给逐片兜底。
+        if _DR_ACTIVE:
+            if not dataset:
+                raise RuntimeError("candidate relink requires a dataset name")
+            _dr_path = Path("/kaggle/working/x138_candidate_prob_cache") / f"{dataset}.probabilities.npz"
+            if not _dr_path.is_file():
+                raise FileNotFoundError(f"Missing candidate probabilities: {_dr_path}")
+            with np.load(_dr_path, allow_pickle=False) as _dr_npz:
+                _dr_src = _dr_npz["source_id"]
+                _dr_tgt = _dr_npz["target_id"]
+                _dr_prob = _dr_npz["d4_prob" if _D4_ACTIVE else "prob"]
+            if not (len(_dr_src) == len(_dr_tgt) == len(_dr_prob)):
+                raise RuntimeError(f"{dataset}: candidate arrays inconsistent")
+            _dr_model_probs = {
+                (int(s), int(t)): float(p)
+                for s, t, p in zip(_dr_src, _dr_tgt, _dr_prob)
+                if int(s) in _dr_initial_node_ids and int(t) in _dr_initial_node_ids and np.isfinite(p)
+            }
+            if not _dr_model_probs:
+                raise RuntimeError(f"{dataset}: no usable candidate probabilities")
+            _dr_raw_radius = float(os.environ.get("BIOHUB_DR_RAW_RADIUS_UM", "10.0"))
+            _dr_geo_raw = {
+                key for key in _dr_raw_keys
+                if edge_distance_um(nodes_by_id[key[0]], nodes_by_id[key[1]]) <= _dr_raw_radius - 0.1
+            }
+            _dr_raw_covered = len(_dr_geo_raw & _dr_model_probs.keys())
+            stats["candidate_cache_pairs"] = len(_dr_src)
+            stats["candidate_usable_pairs"] = len(_dr_model_probs)
+            stats["candidate_geo_raw_edges"] = len(_dr_geo_raw)
+            stats["candidate_geo_raw_covered"] = _dr_raw_covered
+            if _dr_geo_raw and _dr_raw_covered < 0.9 * len(_dr_geo_raw):
+                raise RuntimeError(
+                    f"{dataset}: candidate node mapping suspect: "
+                    f"{_dr_raw_covered}/{len(_dr_geo_raw)} ordinary raw edges covered"
+                )
+            learned_edge_probs.update(_dr_model_probs)
+        # 第一次重链接（经过分裂补全打分器的透明包装，它只记下概率字典）。返回空列表时（例如某帧节点过多）保留 ILP 边。
+        motion_edges = motion_relink_edges(nodes_by_id, stats, learned_edge_probs)
+        # 3 找回：在开放末端的下一帧、开放起点的上一帧 4 µm 内，把 ILP 没选中的检测峰（分数 ≥ 0.94，含略低于检测阈值
+        # 0.965 的峰；离现有节点 > 2 µm）加回节点集，然后在扩大后的节点集上再重链接一次，让它们接进轨迹
+        # （第二次重链接也接不上的暂时是孤立点：孤立点同时算作轨迹末端和起点，后面的三级补缺（作端点，或被单帧缺口
+        # 闭合复用为中间节点）和分裂补全打分器（作无父起点 B）都还可能用上它；始终没用上的在删孤立节点一步被删除）。
+        # 最终 pass 中，找回的节点先继承检测候选的链接概率（_rr_expand_probabilities），再参与第二次重链接。
+        if motion_edges and READMIT_RADIUS_UM > 0:
+            _readmit_before = len(nodes_by_id)
+            nodes_by_id = readmit_discarded_detections(nodes_by_id, motion_edges, stats, dataset=dataset)
+            if len(nodes_by_id) > _readmit_before:
+                if _RR_ACTIVE and _DR_ACTIVE:
+                    learned_edge_probs, _rr_info = _rr_expand_probabilities(
+                        dataset, nodes_by_id, _dr_initial_node_ids, _dr_path,
+                        _dr_src, _dr_tgt, _dr_prob, learned_edge_probs)
+                    stats.update({"readmit_prob_" + key: value for key, value in _rr_info.items()
+                                  if isinstance(value, (int, float))})
+                    stats["readmit_prob_rejections"] = json.dumps(_rr_info["rejected"], sort_keys=True)
+                motion_edges = motion_relink_edges(nodes_by_id, stats, learned_edge_probs) or motion_edges
+        # 重链接成功：用它的边替换全部 ILP 边；_DR_ACTIVE 时额外记录诊断统计（只写统计表，不影响结果）。
+        if motion_edges:
+            if _DR_ACTIVE:
+                _dr_final_pairs = [
+                    (int(e["source_id"]), int(e["target_id"])) for e in motion_edges
+                ]
+                stats["candidate_motion_edges"] = len(_dr_final_pairs)
+                stats["candidate_motion_with_model_prob"] = sum(
+                    pair in _dr_model_probs for pair in _dr_final_pairs
+                )
+                stats["candidate_motion_new_vs_ilp"] = sum(
+                    pair not in _dr_raw_keys for pair in _dr_final_pairs
+                )
+                stats["candidate_motion_new_with_model_prob"] = sum(
+                    pair not in _dr_raw_keys and pair in _dr_model_probs
+                    for pair in _dr_final_pairs
+                )
+                stats["candidate_motion_touching_readmitted_node"] = sum(
+                    pair[0] not in _dr_initial_node_ids or pair[1] not in _dr_initial_node_ids
+                    for pair in _dr_final_pairs
+                )
+            stats["motion_relink_replaced_raw_edges"] = len(edges)
+            edges = motion_edges
+        else:
+            stats["motion_relink_fallback_raw"] = 1
+
+    # 4 单父修复：每个目标节点只保留"概率最高、其次距离最短"的一条入边（细胞谱系是树，每个细胞只有一个母细胞）。
+    # 重链接本身是一对一的，这一步主要在重链接退回 ILP 边时起作用。
+    if OUTPUT_SINGLE_PARENT_REPAIR and edges:
+        best_by_target: dict[int, dict[str, object]] = {}
+        for edge in edges:
+            target_id = int(edge["target_id"])
+            prev = best_by_target.get(target_id)
+            if prev is None or edge_sort_key(edge) > edge_sort_key(prev):
+                best_by_target[target_id] = edge
+        kept_ids = {id(edge) for edge in best_by_target.values()}
+        stats["dropped_multi_parent_edges"] = sum(1 for edge in edges if id(edge) not in kept_ids)
+        edges = [edge for edge in edges if id(edge) in kept_ids]
+
+    # 单子修复（本 kernel 关闭：它会删掉所有分叉）。
+    if OUTPUT_SINGLE_CHILD_REPAIR and edges:
+        best_by_source: dict[int, dict[str, object]] = {}
+        for edge in edges:
+            source_id = int(edge["source_id"])
+            prev = best_by_source.get(source_id)
+            if prev is None or edge_sort_key(edge) > edge_sort_key(prev):
+                best_by_source[source_id] = edge
+        kept_ids = {id(edge) for edge in best_by_source.values()}
+        stats["dropped_multi_child_edges"] = sum(1 for edge in edges if id(edge) not in kept_ids)
+        edges = [edge for edge in edges if id(edge) in kept_ids]
+
+    print(f"  [{dataset}] after edge-filter+motion-relink: {len(nodes_by_id)} nodes, {len(edges)} edges | {_time.time() - _stage_t0:.1f}s")
+    # 5～7 三级补缺：单帧缺口（插中点）→ 严格两帧缺口 → 1～3 帧缺口（低分峰）。
+    # 缓存：单帧缺口闭合使用下面这份原始帧缓存和 DeepCenter 热图缓存；严格两帧缺口不接收它们（函数内部自建帧缓存）；
+    # 低分峰补缺只接收帧缓存（只有插值点精修才读帧，本 kernel 不允许插值点）。后面的安全分裂和分裂补全打分器
+    # 复用同一份帧缓存和热图缓存，已经算过的热图不必重算。
+    repair_frame_cache: dict[int, np.ndarray] = {}
+    deepcenter_heatmap_cache: dict[tuple[str, int], np.ndarray] = {}
+    nodes_by_id, edges = close_single_frame_gaps(
+        nodes_by_id,
+        edges,
+        stats,
+        dataset=dataset,
+        deepcenter_bundle=deepcenter_bundle,
+        frame_cache=repair_frame_cache,
+        deepcenter_cache=deepcenter_heatmap_cache,
+    )
+    nodes_by_id, edges = recover_strict_gap2(nodes_by_id, edges, stats, dataset=dataset)
+    nodes_by_id, edges = fill_gaps_from_low_detections(
+        nodes_by_id, edges, stats, dataset=dataset, frame_cache=repair_frame_cache,
+    )
+    print(f"  [{dataset}] after gap-closing (single-frame + gap2 + low-detection filler): {len(nodes_by_id)} nodes, {len(edges)} edges | {_time.time() - _stage_t0:.1f}s")
+    # 8 分裂：这里调用的 add_safe_divisions_postlink 已被分裂补全打分器的包装器替换——先跑公开基线的安全分裂，
+    # 最终 pass 再追加打分器选出的分叉。放在补缺之后，是因为分裂特征要看子代后续 1～3 帧，依赖完整、延续的轨迹。
+    edges = add_safe_divisions_postlink(
+        nodes_by_id,
+        edges,
+        stats,
+        dataset=dataset,
+        deepcenter_bundle=deepcenter_bundle,
+        frame_cache=repair_frame_cache,
+        deepcenter_cache=deepcenter_heatmap_cache,
+    )
+
+    # 日志：deepcenter_rejected = 几何候选数 − 通过否决后的候选数（也包含对称性拒绝）；added 是安全分裂与打分器补的分叉合计。
+    _geo_cands = stats['safe_division_geometric_candidates']
+    _post_veto_cands = stats['safe_division_candidates']
+    _rejected_by_dc = _geo_cands - _post_veto_cands
+    print(
+        f"  [{dataset}] after safe-division repair: {len(nodes_by_id)} nodes, {len(edges)} edges | {_time.time() - _stage_t0:.1f}s"
+        f" (geometric_candidates={_geo_cands}, deepcenter_rejected={_rejected_by_dc},"
+        f" post_veto_candidates={_post_veto_cands}, added={stats['safe_divisions_added']},"
+        f" cap_skipped={stats['safe_division_skipped_cap']},"
+        f" mutual_nn_rejected={stats['safe_division_mutual_nn_rejected']},"
+        f" divergence_rejected={stats['safe_division_divergence_rejected']})"
+    )
+    # 分叉几何过滤（本 kernel 关闭）。
+    if OUTPUT_DIVISION_GEOMETRY_FILTER and edges:
+        by_source: dict[int, list[dict[str, object]]] = {}
+        for edge in edges:
+            by_source.setdefault(int(edge["source_id"]), []).append(edge)
+
+        filtered: list[dict[str, object]] = []
+        for source_id, source_edges in by_source.items():
+            if len(source_edges) <= 1:
+                filtered.extend(source_edges)
+                continue
+
+            ranked = sorted(source_edges, key=edge_sort_key, reverse=True)
+            source = nodes_by_id[source_id]
+            top1 = ranked[0]
+            top2 = ranked[1]
+            d1 = float(top1["distance_um"])
+            d2 = float(top2["distance_um"])
+            sister = edge_distance_um(nodes_by_id[int(top1["target_id"])], nodes_by_id[int(top2["target_id"])])
+            valid_division = (
+                max(d1, d2) <= DIV_PARENT_MAX_UM
+                and sister <= DIV_SISTER_MAX_UM
+                and int(nodes_by_id[int(top1["target_id"])] ["t"]) == int(source["t"]) + 1
+                and int(nodes_by_id[int(top2["target_id"])] ["t"]) == int(source["t"]) + 1
+            )
+            if valid_division:
+                filtered.extend([top1, top2])
+                stats["dropped_division_edges"] += max(0, len(ranked) - 2)
+            elif DIV_DROP_TO_SINGLE_IF_BAD:
+                filtered.append(top1)
+                stats["dropped_division_edges"] += len(ranked) - 1
+            else:
+                filtered.extend(ranked)
+        edges = filtered
+
+    # 9 删孤立节点：没有任何边的节点不可能贡献边或分裂的 TP，却会计入节点数调整项（例如接不上轨迹的找回点）。
+    if OUTPUT_PRUNE_ISOLATED:
+        incident = {int(edge["source_id"]) for edge in edges} | {int(edge["target_id"]) for edge in edges}
+        if incident:
+            kept_nodes = {node_id: node for node_id, node in nodes_by_id.items() if node_id in incident}
+            stats["pruned_isolated_nodes"] = len(nodes_by_id) - len(kept_nodes)
+            nodes_by_id = kept_nodes
+            edges = [edge for edge in edges if int(edge["source_id"]) in nodes_by_id and int(edge["target_id"]) in nodes_by_id]
+
+    print(f"  [{dataset}] after division-geometry-filter+prune-isolated: {len(nodes_by_id)} nodes, {len(edges)} edges | {_time.time() - _stage_t0:.1f}s")
+    # 10 短轨迹过滤；11 跳变感知线拟合平滑（最后一步，只改坐标）。
+    nodes_by_id, edges = filter_short_track_components(nodes_by_id, edges, stats)
+    print(f"  [{dataset}] after short-track filtering: {len(nodes_by_id)} nodes, {len(edges)} edges"
+          f" (components_removed={stats['short_track_components_removed']})")
+    nodes_by_id = linefit_smooth_jump_aware(nodes_by_id, edges, stats)
+    print(f"  [{dataset}] FINAL: {len(nodes_by_id)} nodes, {len(edges)} edges | {_time.time() - _stage_t0:.1f}s")
+
+    return nodes_by_id, edges, stats
+
+
+# 加载 DeepCenter（公开的 3D U-Net 细胞中心先验模型）一次，传给每部影片的后处理：缺口否决、安全分裂否决、
+# 分裂补全打分器的图像特征都要用它。REQUIRE_DEEPCENTER_VETO 打开时，找不到符合要求的权重会直接报错，
+# 而不是悄悄关闭这些检查。
+DEEPCENTER_VETO_DETECTOR = load_deepcenter_veto_detector()
+
+# 【写提交】逐部影片：读第 4 段写出的 ILP 图（predictions/*/unet_transformer/split_0/<影片>.geff）→ filter_output_graph → 写 CSV。
+# 健壮性：后处理抛出任何异常（或删光了全部节点）都退回 fallback_output_graph（只做最基本的过滤），保证每部隐藏影片都有输出；
+# 自 kernel 启动超过 REPAIR_DEADLINE_S（11.5 h）后关闭耗时的修复阶段，给 12 h 的总时限留余量。
+def write_test_submission(tag: str = "base") -> None:
+    
+    
+    # 第 4 段为每部影片写出一张 .geff；数量必须与测试影片数一致，否则立即报错（宁可失败，也不要漏掉影片）。
+    geffs = sorted((REPO_DIR / "predictions").glob(f"*/{METHOD}/split_0/*.geff"))
+    print(f"Found {len(geffs)} prediction graphs")
+    if len(geffs) != len(test_stems):
+        found = {path.stem for path in geffs}
+        missing = sorted(set(test_stems) - found)
+        raise RuntimeError(f"Expected {len(test_stems)} graphs, found {len(geffs)}. Missing: {missing[:10]}")
+
+    stats_rows: list[dict[str, object]] = []
+    seen_datasets: set[str] = set()
+    row_id = 0
+    total_nodes = 0
+    total_edges = 0
+
+    with SUBMISSION_PATH.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+
+        for geff_path in geffs:
+            dataset = geff_path.stem
+            seen_datasets.add(dataset)
+            graph = graph_from_geff(geff_path)
+
+            # 读入节点（原始体素坐标）和带 edge_prob 的边，正是 filter_output_graph 需要的内存格式。
+            nodes_by_id: dict[int, dict[str, object]] = {}
+            for row in graph.node_attrs().iter_rows(named=True):
+                node_id = int(row["node_id"])
+                nodes_by_id[node_id] = {
+                    "node_id": node_id,
+                    "t": int(row["t"]),
+                    "z": float(row["z"]),
+                    "y": float(row["y"]),
+                    "x": float(row["x"]),
+                }
+
+            raw_edges: list[dict[str, object]] = []
+            for row in graph.edge_attrs().iter_rows(named=True):
+                edge_prob = row.get("edge_prob") if hasattr(row, "get") else None
+                raw_edges.append({
+                    "source_id": int(row["source_id"]),
+                    "target_id": int(row["target_id"]),
+                    "edge_prob": None if edge_prob is None else float(edge_prob),
+                })
+
+            raw_node_count = len(nodes_by_id)
+            _dataset_t0 = _time.time()
+            # 超时降级：一旦超过时限，对剩下的全部影片（以及之后的 pass）关闭重链接（找回在重链接分支里，一并跳过）、
+            # 单帧缺口、两帧缺口、安全分裂和线拟合。低分峰补缺、短轨迹过滤和分裂补全打分器不受这几个开关控制，仍会运行。
+            if not _deadline_degraded and _dataset_t0 - KERNEL_START_TS > REPAIR_DEADLINE_S:
+                _deadline_degrade()
+            # filter_output_graph 会修改输入，先留快照，出错时用快照兜底。
+            _nodes_snapshot = {node_id: dict(node) for node_id, node in nodes_by_id.items()}
+            _edges_snapshot = [dict(edge) for edge in raw_edges]
+            try:
+                nodes_by_id, edges, filter_stats = filter_output_graph(nodes_by_id, raw_edges, dataset=dataset, deepcenter_bundle=DEEPCENTER_VETO_DETECTOR)
+                filter_stats["repair_fallback"] = 0
+                if not nodes_by_id:
+                    raise AssertionError(f"{dataset}: post-processing removed every node")
+            except Exception as _repair_exc:
+                _traceback.print_exc()
+                print(
+                    f"  [{dataset}] REPAIR FAILED ({type(_repair_exc).__name__}: {_repair_exc});"
+                    " writing the ILP graph with basic filtering instead",
+                    flush=True,
+                )
+                nodes_by_id, edges, filter_stats = fallback_output_graph(_nodes_snapshot, _edges_snapshot)
+            filter_stats["deadline_degraded"] = int(_deadline_degraded)
+            filter_stats["repair_seconds"] = round(_time.time() - _dataset_t0, 1)
+            filter_stats["kernel_elapsed_seconds"] = round(_time.time() - KERNEL_START_TS, 1)
+            print(
+                f"  [{dataset}] repair {_time.time() - _dataset_t0:.1f}s"
+                f" | kernel elapsed {_time.time() - KERNEL_START_TS:.0f}s",
+                flush=True,
+            )
+            if not nodes_by_id:
+                raise AssertionError(f"{dataset}: post-processing removed every node")
+
+            # 节点行：坐标取最近的整数体素（Python round）并截到 ≥ 0（提交要求整数坐标）——亚体素级的坐标修正和平滑，
+            # 只有让坐标跨过取整边界（小数部分 0.5）时才会改变提交。
+            for node_id in sorted(nodes_by_id):
+                node = nodes_by_id[node_id]
+                writer.writerow({
+                    "id": row_id,
+                    "dataset": dataset,
+                    "row_type": "node",
+                    "node_id": int(node["node_id"]),
+                    "t": int(node["t"]),
+                    "z": max(0, int(round(float(node["z"])))),
+                    "y": max(0, int(round(float(node["y"])))),
+                    "x": max(0, int(round(float(node["x"])))),
+                    "source_id": -1,
+                    "target_id": -1,
+                })
+                row_id += 1
+
+            # 边行：source_id → target_id；顺便统计出度 ≥ 2 的节点数（分叉数）写进统计表。
+            division_sources: dict[int, int] = {}
+            for edge in edges:
+                source_id = int(edge["source_id"])
+                target_id = int(edge["target_id"])
+                if source_id not in nodes_by_id or target_id not in nodes_by_id:
+                    raise AssertionError(f"{dataset}: dangling edge after filtering")
+                writer.writerow({
+                    "id": row_id,
+                    "dataset": dataset,
+                    "row_type": "edge",
+                    "node_id": -1,
+                    "t": -1,
+                    "z": -1,
+                    "y": -1,
+                    "x": -1,
+                    "source_id": source_id,
+                    "target_id": target_id,
+                })
+                row_id += 1
+                division_sources[source_id] = division_sources.get(source_id, 0) + 1
+
+            node_count = len(nodes_by_id)
+            edge_count = len(edges)
+            total_nodes += node_count
+            total_edges += edge_count
+            stats_rows.append({
+                "dataset": dataset,
+                "raw_nodes": raw_node_count,
+                "nodes": node_count,
+                "raw_edges": filter_stats["raw_edges"],
+                "edges": edge_count,
+                "division_like_sources": sum(1 for count in division_sources.values() if count >= 2),
+                "edge_to_node_ratio": edge_count / max(node_count, 1),
+                "gap_added_nodes_frac": filter_stats.get("gap_added_nodes", 0) / max(raw_node_count, 1),
+                **filter_stats,
+            })
+
+    # 最终检查：影片集合与测试集一致、行计数一致、至少有一个节点、表头正确；每部影片的统计写到 run_stats.csv。
+    expected_datasets = set(test_stems)
+    missing_datasets = sorted(expected_datasets - seen_datasets)
+    extra_datasets = sorted(seen_datasets - expected_datasets)
+    if missing_datasets or extra_datasets:
+        raise AssertionError({"missing": missing_datasets[:10], "extra": extra_datasets[:10]})
+    assert row_id == total_nodes + total_edges, "Internal row counter mismatch"
+    assert total_nodes > 0, "No node rows produced"
+
+    header = SUBMISSION_PATH.open().readline().strip().split(",")
+    assert header == CSV_COLUMNS, f"Bad CSV header: {header}"
+
+    stats = pd.DataFrame(stats_rows).sort_values("dataset").reset_index(drop=True)
+    stats["predict_minutes_total"] = predict_seconds / 60.0
+    stats["experiment_tag"] = f"{EXPERIMENT_TAG}:{tag}"
+    stats.to_csv(RUN_STATS_PATH, index=False)
+
+    print(f"Wrote {SUBMISSION_PATH} with {row_id:,} rows")
+    print(f"Node rows: {total_nodes:,} | edge rows: {total_edges:,}")
+    print(f"Wrote {RUN_STATS_PATH}")
+    display(pd.read_csv(SUBMISSION_PATH, nrows=8))
+
+
+# 第一遍 pass：后处理中本方案新增的五个开关（候选概率重链接、全局位移估计与跳变感知平滑、关联特征修正、
+# 找回概率打分、分裂补全打分器）此时全部关闭，对全部测试影片写出一份 submission.csv（同时验证整条管线能跑通）。
+# 预测阶段（检测、关联、ILP、10 折坐标头）只在第 4 段跑一次，各遍 pass 读同一批 ILP 图，区别只在后处理。
+# 第 11 段的最终 pass 打开全部模块后会覆盖这份文件。
+write_test_submission("base")
+
+
+
+# ===== 第 6 段：第一遍输出的审计（提交格式、保留率守卫、谱系图合法性） =====
+# 第 5 段末尾的 write_test_submission("base") 已经写出第一遍（参照一遍）的 submission.csv。本段在继续之前做硬性审计，
+#   任何一项不符合就直接抛异常、让 notebook 失败：隐藏集重跑一次要好几个小时，格式或拓扑错误应当在可见集的
+#   保存运行里就暴露出来，而不是浪费一次提交。审计三件事：
+#   1) 提交表格式：列名与顺序、id 从 0 连续、只有 node / edge 两种行、影像集合与测试目录完全一致；
+#   2) 双模型检测融合的“保留率守卫”是否严格按规则执行；
+#   3) 每段影像的谱系图是否合法：边只连相邻两帧、每个节点至多一个父亲、至多两个子细胞。
+# 注意：这里审计的是第一遍的结果；第 11 段的最终一遍会覆盖 submission.csv，本段不会对最终文件再跑一次。
+#   本段的 /kaggle/working 是写死的路径（不是 WORKING_DIR），离开 Kaggle 运行时要一起改。
+
+from collections import Counter
+import hashlib
+import json
+from pathlib import Path
+
+import pandas as pd
+import torch
+
+# ---- 1) 提交表格式 ----
+# 提交是一张“节点行 + 边行”共用的表：id 是全表连续行号，dataset 是影像名，row_type 区分节点行与边行，
+#   节点行填 node_id 与 t/z/y/x，边行填 source_id/target_id，用不到的列填 -1（与第 5 段的 CSV_COLUMNS 相同）。
+_guard_submission = Path("/kaggle/working/submission.csv")
+_guard_columns = [
+    "id", "dataset", "row_type", "node_id", "t", "z", "y", "x",
+    "source_id", "target_id",
+]
+if not _guard_submission.is_file():
+    raise FileNotFoundError(_guard_submission)
+_guard_frame = pd.read_csv(_guard_submission)
+if _guard_frame.empty or _guard_frame.columns.tolist() != _guard_columns:
+    raise RuntimeError("Retention-guard submission schema changed")
+if _guard_frame["id"].tolist() != list(range(len(_guard_frame))):
+    raise RuntimeError("Retention-guard row IDs are not contiguous")
+if set(_guard_frame["row_type"].unique()) != {"node", "edge"}:
+    raise RuntimeError("Retention-guard row types changed")
+
+# 提交里出现的影像必须与 TEST_DIR 下的 *.zarr 一一对应：漏掉一段或多出一段，都说明前面的步骤出了问题。
+_guard_datasets = sorted(_guard_frame["dataset"].astype(str).unique())
+_guard_expected = sorted(
+    path.name.removesuffix(".zarr")
+    for path in TEST_DIR.iterdir()
+    if path.name.endswith(".zarr")
+)
+if _guard_datasets != _guard_expected:
+    raise RuntimeError({"expected": _guard_expected, "actual": _guard_datasets})
+
+# ---- 2) 双模型检测融合的保留率守卫 ----
+# 检测时把主模型与副模型（同结构、另一个随机种子训练）的检测 logit 按 0.2 : 0.8 加权平均（第 3 段：副模型权重 0.80），
+#   两个模型的随机误差部分抵消，热图更稳。但在个别帧上，平均可能把一批弱峰一起压到检测阈值以下，造成成片漏检。
+# 规则（固定 90%）：分别数出“只用主模型”和“融合后”各能检出多少个峰；若融合后的峰数不足主模型的 90%，
+#   这一帧回退为只用主模型（use_primary = True）。判断在 GPU 推理子进程里逐帧执行（第 4 段打进推理脚本的补丁），
+#   每帧写一条记录到 retention_guard_<分片>.jsonl。
+# 这里逐条复核：有记录、(影像, 帧) 不重复、覆盖每段影像、阈值确实是 0.9、计数非负，并按同一规则重算回退决定。
+#   如果补丁静默失效（例如被别的补丁改坏），这里会直接报错，而不是悄悄少了一道保护。
+_guard_records = []
+for _guard_path in sorted(Path("/kaggle/working").glob("retention_guard_*.jsonl")):
+    for _guard_line in _guard_path.read_text().splitlines():
+        if _guard_line.strip():
+            _guard_records.append(json.loads(_guard_line))
+if not _guard_records:
+    raise RuntimeError("No frame-retention diagnostics were produced")
+
+_guard_keys = [
+    (str(row["dataset"]), int(row["frame"])) for row in _guard_records
+]
+if len(_guard_keys) != len(set(_guard_keys)):
+    raise RuntimeError("Duplicate frame-retention diagnostics")
+if sorted(set(movie for movie, _ in _guard_keys)) != _guard_expected:
+    raise RuntimeError("Frame-retention diagnostics do not cover every movie")
+for _guard_record in _guard_records:
+    if (
+        float(_guard_record["minimum_retention"])
+        != 0.9
+        or int(_guard_record["primary_candidates"]) < 0
+        or int(_guard_record["blended_candidates"]) < 0
+    ):
+        raise RuntimeError("Frame-retention diagnostic contract changed")
+    # 按规则重算：主模型有峰、且保留率 = 融合峰数 / 主模型峰数 < 0.9 时才应回退到主模型。
+    _guard_expected_use_primary = bool(
+        int(_guard_record["primary_candidates"]) > 0
+        and float(_guard_record["retention"])
+        < 0.9
+    )
+    if bool(_guard_record["use_primary"]) != _guard_expected_use_primary:
+        raise RuntimeError("Frame-retention decision is inconsistent")
+
+# ---- 3) 谱系图合法性（逐段影像）----
+# 评测把提交看成一张有向图：节点 = 某一帧里的一个细胞，边 = 同一个细胞从 t 帧到 t+1 帧（或母细胞到子细胞）。
+#   因此：节点的帧号与坐标不能为负；每条边两端的节点都必须存在，且 t(目标) = t(源) + 1；
+#   入度 ≤ 1（一个细胞只有一个“上一帧的自己”或母亲），出度 ≤ 2（一次分裂最多产生两个子细胞）。
+#   官方评测在计边前会丢弃跨多帧的边、把出度截到 2，这类边拿不到分；入度 > 1 在生物学上也不可能。
+#   出现任何违规都说明后处理有 bug，所以这里直接报错。
+# division_parents 统计出度恰为 2 的节点数，也就是输出里的分裂（分叉）数，供人工核对。
+_guard_topology = {}
+for _guard_movie, _guard_group in _guard_frame.groupby("dataset", sort=True):
+    _guard_nodes = _guard_group[_guard_group["row_type"].eq("node")]
+    _guard_edges = _guard_group[_guard_group["row_type"].eq("edge")]
+    if _guard_nodes.empty or _guard_nodes["t"].lt(0).any():
+        raise RuntimeError(f"{_guard_movie}: invalid biological node time")
+    if _guard_nodes[["z", "y", "x"]].lt(0).any().any():
+        raise RuntimeError(f"{_guard_movie}: negative biological coordinate")
+    _guard_node_time = dict(zip(
+        _guard_nodes["node_id"].astype(int),
+        _guard_nodes["t"].astype(int),
+    ))
+    _guard_incoming = Counter()
+    _guard_outgoing = Counter()
+    for _guard_edge in _guard_edges.itertuples():
+        _guard_source = int(_guard_edge.source_id)
+        _guard_target = int(_guard_edge.target_id)
+        if (
+            _guard_source not in _guard_node_time
+            or _guard_target not in _guard_node_time
+            or _guard_node_time[_guard_target]
+            != _guard_node_time[_guard_source] + 1
+        ):
+            raise RuntimeError(f"{_guard_movie}: invalid lineage edge")
+        _guard_incoming[_guard_target] += 1
+        _guard_outgoing[_guard_source] += 1
+    _guard_max_in = max(_guard_incoming.values(), default=0)
+    _guard_max_out = max(_guard_outgoing.values(), default=0)
+    if _guard_max_in > 1 or _guard_max_out > 2:
+        raise RuntimeError(f"{_guard_movie}: invalid lineage degree")
+    _guard_topology[_guard_movie] = {
+        "nodes": int(len(_guard_nodes)),
+        "edges": int(len(_guard_edges)),
+        "max_indegree": int(_guard_max_in),
+        "max_outdegree": int(_guard_max_out),
+        "division_parents": int(sum(
+            value == 2 for value in _guard_outgoing.values()
+        )),
+    }
+
+# 逐段影像汇总保留率守卫：总帧数、回退帧数、最小 / 中位保留率。回退帧多，说明两个模型在这段影像上分歧大。
+_guard_by_movie = {}
+for _guard_movie in _guard_expected:
+    _guard_movie_records = [
+        row for row in _guard_records if row["dataset"] == _guard_movie
+    ]
+    _guard_by_movie[_guard_movie] = {
+        "frames": int(len(_guard_movie_records)),
+        "fallback_frames": int(sum(
+            bool(row["use_primary"]) for row in _guard_movie_records
+        )),
+        "minimum_retention": float(min(
+            row["retention"] for row in _guard_movie_records
+        )),
+        "median_retention": float(pd.Series(
+            [row["retention"] for row in _guard_movie_records]
+        ).median()),
+    }
+
+# 写审计报告 JSON（只供核查，不影响任何输出）。sha256 是这份 CSV 的指纹，可以和别的运行逐字节比对。
+# 报告里的 experiment / parent_experiment / method_attribution / source_kernel / quality_promotion 等字段和
+#   configuration 字典，都是从上游公开 notebook 原样继承的静态元数据（method_attribution 注明保留率规则出自
+#   其他参赛者公开的 CC0 notebook）。configuration 并不读取本管线的实际参数，有几项已经过时：实际检测阈值是 0.965
+#   （这里写 0.96875）、副模型检测权重是 0.80（这里写 0.475）、ILP 消失权重是 2（这里写 1.5）、
+#   缺口闭合距离 GAP_CLOSE_UM 是 5.0 µm（这里写 5.8）。读报告时以第 0 段（副模型权重在第 3 段）的实际设置为准。
+_guard_digest = hashlib.sha256(_guard_submission.read_bytes()).hexdigest()
+_guard_report = {
+    "experiment": "harmonic_bidirectional_association_v1",
+    "status": "clean_graph_audit_pass_candidate_unverified_quality",
+    "parent_experiment": "paired_bidirectional_primary_weight020_vs_forward_v1",
+    "method_attribution": "fixed-90 dual-seed baseline with harmonic mutual-support association fusion (rule from public CC0 notebook yusuketogashi/no-hack-biohub-cell-another-approch-3rd v18)",
+    "source_kernel": "raykkretzschmar/biohub-bidirectional-primary-union13-diagnostic-v1",
+    "source_notebook_sha256": "3e65ca691941949196bf417030ea84fccafe16baaec174b2a63540451bb937e8",
+    "public_output_used": False,
+    "metric_hack_used": False,
+    "organizer_labels_used_for_configuration": False,
+    "leaderboard_feedback_used_for_configuration": True,
+    "configuration": {
+        "minimum_candidate_retention": 0.9,
+        "fallback_scope": "individual_frame",
+        "detector_threshold": 0.96875,
+        "secondary_detection_weight": 0.475,
+        "secondary_edge_weight": 0.15,
+        "bidirectional_primary_weight": 0.30,
+        "secondary_link_mode": "low_margin_consensus",
+        "secondary_low_margin_max": 0.35,
+        "edge_candidate_threshold": 0.48,
+        "ilp_appearance_weight": 0.0,
+        "ilp_disappearance_weight": 1.5,
+        "gap_close_um": 5.8,
+        "deepcenter_gap_threshold": 0.25,
+        "deepcenter_gap_confirm_min_span_um": 8.5,
+    },
+    "hardware": {
+        "visible_gpu_count": int(torch.cuda.device_count()),
+    },
+    "diagnostics": {
+        "rows": int(len(_guard_records)),
+        "fallback_frames": int(sum(
+            bool(row["use_primary"]) for row in _guard_records
+        )),
+        "by_movie": _guard_by_movie,
+    },
+    "submission": {
+        "sha256": _guard_digest,
+        "rows": int(len(_guard_frame)),
+        "datasets": _guard_datasets,
+    },
+    "topology": _guard_topology,
+    "quality_promotion": {
+        "status": "candidate_unverified",
+        "required_receipt": "bidirectional_blend_union13_receipt.json",
+        "required_condition": "promote=true",
+        "execute_push_submit": "FORBIDDEN_UNTIL_REQUIRED_CONDITION",
+        "validated_receipt_sha256": None,
+    },
+}
+Path("/kaggle/working/dual_seed_frame_retention_guard_report.json").write_text(
+    json.dumps(_guard_report, indent=2, sort_keys=True) + "\n"
+)
+print(json.dumps(_guard_report, indent=2, sort_keys=True))
+
+
+# ===== 第 7 段：本地验证器（最终版本中关闭）——挑选留出的训练影像并在其上跑推理 =====
+# 为什么需要本地验证器：公榜只覆盖隐藏集的一部分，分数噪声大；可见的 4 段“测试影像”又只是训练集同名影像的逐像素副本，
+#   GT 分裂只有 3 个，一次分裂判对判错就让分数变化约 0.025，不能拿来做 A/B。
+#   思路：在带 GT 的训练影像上，用与测试完全相同的推理命令得到原始 ILP 图（GPU 只算一次），再在 CPU 上
+#   反复运行后处理、用复现的官方指标（第 8 段）打分，比较不同的后处理参数（第 9–10 段）。
+# 局限：这些训练影像也参与了检测 / 关联模型（公开权重）的训练，所以这是“样本内”代理指标，
+#   只适合比较后处理参数的相对好坏，不能估计隐藏集上的真实分数。
+# 最终版本在第 0 段设置 BIOHUB_VALIDATOR_ENABLE = "0"（每跑一次约占 11 分钟 GPU），所以第 7–10 段实际只做这些事：
+#   定义函数（合并分片、指标、参数替换、打分）、打印 disabled / skipping、保持基线后处理配置（selected_config = {}）、
+#   写出 ppsweep_selected.json，以及在第 10 段末尾对第一遍的 submission.csv 再做一次断言。
+#   第 11 段会用到第 9 段定义的 pp_apply / pp_restore。
+# 想自己做实验：把第 0 段的 BIOHUB_VALIDATOR_ENABLE 改成 "1"，每个胚胎取 BIOHUB_VALIDATOR_N_PER_TYPE 段影像（第 0 段设为 4）。
+
+TRAIN_DIR = COMP_DIR / "train"
+
+# 验证器参数：默认开启（只有 "0" 才关闭，第 0 段正是设为 "0"）；每个胚胎取 2 段（第 0 段改为 4）；
+#   匹配半径 7 µm、节点数惩罚系数 0.1、分裂项权重 0.1，都与官方指标一致。
+VALIDATOR_ENABLE = os.environ.get("BIOHUB_VALIDATOR_ENABLE", "1") != "0"
+VALIDATOR_N_PER_TYPE = int(os.environ.get("BIOHUB_VALIDATOR_N_PER_TYPE", "2"))
+VALIDATOR_MATCH_RADIUS_UM = float(os.environ.get("BIOHUB_VALIDATOR_MATCH_RADIUS_UM", "7.0"))
+VALIDATOR_NODE_COUNT_PENALTY_A = float(os.environ.get("BIOHUB_VALIDATOR_NODE_COUNT_PENALTY_A", "0.1"))
+VALIDATOR_DIVISION_WEIGHT = float(os.environ.get("BIOHUB_VALIDATOR_DIVISION_WEIGHT", "0.1"))
+VALIDATOR_STATS_PATH = WORKING_DIR / "validator_results.csv"
+
+# 挑选留出影像：先排除与测试目录同名的训练影像（可见的 4 段测试影像就是训练集的副本，
+#   同名影像的预测文件也会和测试推理的输出重名、互相混淆）。
+val_stems: list[str] = []
+if VALIDATOR_ENABLE and TRAIN_DIR.exists():
+    train_stems_all = sorted(p.name[:-5] for p in TRAIN_DIR.iterdir() if p.name.endswith(".zarr"))
+    test_stem_set = set(test_stems)  
+    overlap = [s for s in train_stems_all if s in test_stem_set]
+    if overlap:
+        print(f"VALIDATOR: excluding {len(overlap)} TRAIN stem(s) that also appear in TEST_DIR: {overlap}")
+    candidates = [s for s in train_stems_all if s not in test_stem_set]
+
+    # 判断一段训练影像的 GT 里有没有分裂（存在出度 ≥ 2 的节点）。整个训练集只有约 151 次分裂，
+    #   随机抽几段很可能一次都没有，分裂项就无从评估，所以优先挑含分裂的影像。
+    def _stem_has_gt_division(stem: str) -> bool:
+        gt_path = TRAIN_DIR / f"{stem}.geff"
+        try:
+            graph = graph_from_geff(gt_path)
+        except Exception:
+            return False
+        out_degree: dict[int, int] = {}
+        for row in graph.edge_attrs().iter_rows(named=True):
+            s = int(row["source_id"])
+            out_degree[s] = out_degree.get(s, 0) + 1
+        return any(d >= 2 for d in out_degree.values())
+
+    # 按胚胎分层：影像名的前缀（44b6 / 6bba）就是胚胎编号。两个胚胎的细胞密度、运动幅度差别很大，
+    #   分层保证两个胚胎都被测到。每层内的排序键是 (不含分裂, 影像名)：含分裂的排在前面，取前 N 段。
+    by_prefix: dict[str, list[str]] = {}
+    for s in candidates:
+        by_prefix.setdefault(s.split("_")[0], []).append(s)
+
+    division_flags: dict[str, bool] = {}
+    for prefix, stems in by_prefix.items():
+        for s in stems:
+            division_flags[s] = _stem_has_gt_division(s)
+
+    for prefix, stems in sorted(by_prefix.items()):
+        ranked = sorted(stems, key=lambda s: (not division_flags[s], s))
+        val_stems.extend(ranked[:VALIDATOR_N_PER_TYPE])
+    n_division_selected = sum(1 for s in val_stems if division_flags[s])
+    print(f"VALIDATOR: selected {len(val_stems)} held-out TRAIN samples "
+          f"({VALIDATOR_N_PER_TYPE} per embryo-type prefix, {len(by_prefix)} prefixes found, "
+          f"{n_division_selected} contain a GT division)")
+    print(val_stems)
+elif VALIDATOR_ENABLE:
+    print(f"VALIDATOR: TRAIN_DIR not found at {TRAIN_DIR} -- skipping.")
+else:
+    print("VALIDATOR: disabled (BIOHUB_VALIDATOR_ENABLE=0).")
+
+
+# 双 GPU 并行时，每个推理子进程按 --slice k::2 处理一半影像，写到各自的方法目录（<方法>_gpu0 / <方法>_gpu1）。
+#   合并时逐片校验：每片恰好是它应处理的影像、片间无重复、合起来覆盖全部留出影像；
+#   先全部移进 staging 目录、校验通过后再整体 rename 成 split_0：rename 是原子操作，不会留下“合并了一半”的目录。
+def _merge_validator_shards(worker_count: int, stems: list[str], method_prefix: str) -> Path:
+    """与第 4 段的 _merge_prediction_shards 逻辑相同，只是把影像列表和方法名前缀做成了参数：
+    那个函数写死了测试集的 test_stems / METHOD，不能直接拿来合并另一批影像。"""
+    import shutil as _shutil
+    shard_dirs: list[Path] = []
+    seen: set[str] = set()
+    expected_all = set(stems)
+
+    for shard_index in range(worker_count):
+        shard_method = f"{method_prefix}_gpu{shard_index}"
+        shard_dir = _prediction_dir_for_method(shard_method)
+        expected = set(stems[shard_index::worker_count])
+        found = {p.stem for p in sorted(shard_dir.glob("*.geff"))}
+        if found != expected:
+            raise RuntimeError(
+                f"VALIDATOR shard {shard_index} output mismatch: "
+                f"missing={sorted(expected - found)}, extra={sorted(found - expected)}"
+            )
+        overlap_ds = seen & found
+        if overlap_ds:
+            raise RuntimeError(f"VALIDATOR: duplicate datasets across shards: {sorted(overlap_ds)}")
+        seen.update(found)
+        shard_dirs.append(shard_dir)
+
+    if seen != expected_all:
+        raise RuntimeError(
+            f"VALIDATOR: merged shards do not cover the held-out set: "
+            f"missing={sorted(expected_all - seen)}, extra={sorted(seen - expected_all)}"
+        )
+
+    # 两个分片必须写在同一个预测根目录下（predictions/<根目录>/<方法>/split_0），合并结果也放在这个根目录里。
+    #   变量名里的 username 只是沿用推理代码的叫法，指 predictions/ 下的那一级目录。
+    username_roots = {shard_dir.parents[1] for shard_dir in shard_dirs}
+    if len(username_roots) != 1:
+        raise RuntimeError(f"VALIDATOR: shards used inconsistent prediction roots: {username_roots}")
+
+    final_root = next(iter(username_roots)) / method_prefix
+    final_dir = final_root / "split_0"
+    staging_dir = final_root / "split_0_val_staging"
+    if staging_dir.exists():
+        _shutil.rmtree(staging_dir) if staging_dir.is_dir() else staging_dir.unlink()
+    staging_dir.mkdir(parents=True, exist_ok=False)
+
+    for shard_dir in shard_dirs:
+        for source in sorted(shard_dir.glob("*.geff")):
+            destination = staging_dir / source.name
+            if destination.exists():
+                raise RuntimeError(f"VALIDATOR: refusing to overwrite duplicate output: {destination}")
+            _shutil.move(str(source), str(destination))
+
+    merged = {p.stem for p in staging_dir.glob("*.geff")}
+    if merged != expected_all:
+        raise RuntimeError(
+            f"VALIDATOR: staged directory failed verification: "
+            f"missing={sorted(expected_all - merged)}, extra={sorted(merged - expected_all)}"
+        )
+
+    if final_dir.exists():
+        _shutil.rmtree(final_dir) if final_dir.is_dir() else final_dir.unlink()
+    staging_dir.rename(final_dir)
+    for shard_dir in shard_dirs:
+        _shutil.rmtree(shard_dir.parent)
+    print(f"VALIDATOR: merged {len(merged)} prediction graphs into {final_dir}")
+    return final_dir
+
+
+# 在留出的训练影像上运行与测试完全相同的推理命令：同一套权重、检测阈值、四个 ILP 权重，只把 --data-dir 换成
+#   训练目录、方法名加 _val 后缀。write_test_submission 只读取 predictions/*/unet_transformer/split_0/ 下的图，
+#   所以验证器的输出（unet_transformer_val）不会混进测试提交。
+# 有 ≥ 2 张 GPU 时按 --slice k::2 拆成两个子进程并行（各自用 CUDA_VISIBLE_DEVICES 绑定一张卡），否则单进程运行。
+predict_val_seconds = None
+if VALIDATOR_ENABLE and val_stems:
+    val_splits_path = REPO_DIR / "kaggle_val_splits.json"
+    val_splits_path.write_text(json.dumps([{"split": 0, "train": [], "test": val_stems}], indent=2))
+    val_method_prefix = f"{METHOD}_val"
+
+    predict_val_cmd = [
+        sys.executable, "scripts/predict_unet_transformer.py",
+        "--data-dir", str(TRAIN_DIR),
+        "--splits", str(val_splits_path.name),
+        "--split", "0",
+        "--weights", WEIGHTS_RELATIVE,
+        "--unet-batch-size", str(UNET_BATCH_SIZE),
+        "--det-threshold", str(DET_THRESHOLD),
+        "--ilp-edge-weight", str(ILP_EDGE_WEIGHT),
+        "--ilp-appearance-weight", str(ILP_APPEARANCE_WEIGHT),
+        "--ilp-disappearance-weight", str(ILP_DISAPPEARANCE_WEIGHT),
+        "--ilp-division-weight", str(ILP_DIVISION_WEIGHT),
+    ]
+    if USE_ILP:
+        predict_val_cmd.append("--use-ilp")
+
+    _val_start = time.time()
+    val_worker_count = min(2, _torch.cuda.device_count(), len(val_stems))
+    if val_worker_count >= 2:
+        cuda_tokens = _visible_cuda_tokens(val_worker_count)
+        val_processes: dict[int, subprocess.Popen] = {}
+        val_commands: dict[int, list[str]] = {}
+        print(f"VALIDATOR: launching {val_worker_count} shards on CUDA devices {cuda_tokens}")
+        for shard_index in range(val_worker_count):
+            shard_cmd = [*predict_val_cmd, "--method", f"{val_method_prefix}_gpu{shard_index}",
+                         "--slice", f"{shard_index}::{val_worker_count}"]
+            shard_env = {**os.environ, "PYTHONPATH": "src"}
+            shard_env["CUDA_VISIBLE_DEVICES"] = cuda_tokens[shard_index]
+            val_commands[shard_index] = shard_cmd
+            val_processes[shard_index] = subprocess.Popen(shard_cmd, cwd=REPO_DIR, env=shard_env)
+        _wait_for_prediction_shards(val_processes, val_commands)
+        _merge_validator_shards(val_worker_count, val_stems, val_method_prefix)
+    else:
+        print("VALIDATOR: using single-process prediction (fewer than 2 GPUs or samples).")
+        subprocess.run([*predict_val_cmd, "--method", val_method_prefix],
+                        cwd=REPO_DIR, env={**os.environ, "PYTHONPATH": "src"}, check=True)
+    predict_val_seconds = time.time() - _val_start
+    print(f"VALIDATOR: prediction completed in {predict_val_seconds / 60:.2f} minutes")
+
+
+# ===== 第 8 段：官方指标的本地复现（供验证器打分） =====
+# 官方指标：score = 调整后的边 Jaccard + 0.1 × 分裂 Jaccard。本段按官方定义逐项实现：
+#   逐帧 7 µm 最优一对一匹配 → 稀疏 GT 下的边 TP/FP/FN → 节点数调整 → 跨影像加权平均；分裂项跨影像 micro 平均。
+# 与官方实现的差别（所以只能叫“代理分”）：
+#   · 没有实现官方在计边前的清洗步骤（去重、丢弃跨多帧的边、合并折叠、出度截到 2）。本管线的输出已经保证
+#     只有相邻帧的边、单父、至多两子，所以影响很小；
+#   · 分裂项用的是指标修补前的旧规则（母细胞与两个子代谱系落在同一个弱连通分量里、且分量里有分叉就算对）；现行官方
+#     规则看有向的局部拓扑（祖父 → 母细胞 → 子细胞 → 孙代这个窗口内对上，允许早或晚 1 帧），所以这里的分裂项更宽松。
+
+from scipy.optimize import linear_sum_assignment
+
+
+# 【1. 逐帧最优一对一匹配】只在同一帧内匹配。坐标（体素下标）乘体素尺寸 (1.625, 0.40625, 0.40625) µm 换成物理坐标，
+#   距离超过 max_dist（7 µm）的配对代价设成 1e6（等于禁止），再用匈牙利算法 linear_sum_assignment 求总距离最小的
+#   一一对应，最后丢掉代价为 1e6 的“被迫配对”。
+# 含义：一个 GT 细胞最多配一个预测点，在同一个细胞旁重复放检测点拿不到任何分，只会增加节点数（见节点数调整）。
+#   7 µm 很宽（约 z 方向 4 层、xy 方向 17 个像素），2 µm 以内的定位误差不影响能否配上，但会影响后面的连边。
+def match_nodes_bipartite(pred_nodes: dict, gt_nodes: dict, max_dist: float = 7.0):
+    pred_by_t: dict[int, list[int]] = {}
+    for pid, (t, *_r) in pred_nodes.items():
+        pred_by_t.setdefault(int(t), []).append(pid)
+    gt_by_t: dict[int, list[int]] = {}
+    for gid, (t, *_r) in gt_nodes.items():
+        gt_by_t.setdefault(int(t), []).append(gid)
+
+    pred_to_gt: dict[int, int] = {}
+    gt_to_pred: dict[int, int] = {}
+    for t, p_ids in pred_by_t.items():
+        g_ids = gt_by_t.get(t, [])
+        if not g_ids:
+            continue
+        voxel_scale = np.array(VOXEL_SCALE_UM, dtype=float)
+        p_pos = np.array([pred_nodes[p][1:] for p in p_ids], dtype=float) * voxel_scale
+        g_pos = np.array([gt_nodes[g][1:] for g in g_ids], dtype=float) * voxel_scale
+        diff = p_pos[:, None, :] - g_pos[None, :, :]
+        cost = np.sqrt((diff ** 2).sum(axis=-1))
+        BIG = 1e6
+        cost_gated = np.where(cost <= max_dist, cost, BIG)
+        row_ind, col_ind = linear_sum_assignment(cost_gated)
+        for r, c in zip(row_ind, col_ind):
+            if cost_gated[r, c] >= BIG:
+                continue
+            pred_to_gt[p_ids[r]] = g_ids[c]
+            gt_to_pred[g_ids[c]] = p_ids[r]
+    return pred_to_gt, gt_to_pred
+
+
+# 【2. 稀疏 GT 下的边 TP / FP / FN】GT 只标注了约 2.8% 的细胞，所以不能把“不在 GT 里的边”都算错：
+#   TP：两端都匹配到 GT 节点，且这两个 GT 节点之间确有 GT 边；
+#   FP：只算与已标注关系“冲突”的非 TP 边：目标端匹配的 GT 节点在 GT 里已有父亲（gt_incoming_source），
+#       或源端匹配的 GT 节点在 GT 里已有子节点（gt_outgoing）；
+#   FN：没有被任何预测边恢复的 GT 边。
+#   其余落在未标注区域的预测边既不加分也不扣分：多连边在未标注区不受罚，过度检测只能靠节点数调整项约束。
+def compute_edge_confusion(pred_edges, gt_edges, pred_to_gt, gt_to_pred):
+    gt_edge_set = set(gt_edges)
+    gt_outgoing: dict[int, set[int]] = {}
+    gt_incoming_source: dict[int, int] = {}
+    for s, t in gt_edge_set:
+        gt_outgoing.setdefault(s, set()).add(t)
+        gt_incoming_source[t] = s
+
+    tp = 0
+    fp = 0
+    matched_gt_edges = set()
+    for s, t in pred_edges:
+        ms = pred_to_gt.get(s)
+        mt = pred_to_gt.get(t)
+        is_tp = ms is not None and mt is not None and mt in gt_outgoing.get(ms, ())
+        if is_tp:
+            tp += 1
+            matched_gt_edges.add((ms, mt))
+            continue
+        is_fp = (mt is not None and mt in gt_incoming_source) or (
+            ms is not None and bool(gt_outgoing.get(ms))
+        )
+        if is_fp:
+            fp += 1
+    fn = len(gt_edge_set - matched_gt_edges)
+    return tp, fp, fn
+
+
+# Jaccard = TP / (TP + FP + FN)，分母为 0 时记 0。分裂项也复用这个函数。
+def edge_jaccard(tp: int, fp: int, fn: int) -> float:
+    denom = tp + fp + fn
+    return tp / denom if denom else 0.0
+
+
+# 【3. 节点数调整】adj = max(0, J × (1 − a × (T_pred − T_true) / T_true))，a = 0.1。
+#   T_pred 是该影像的全部预测节点数，T_true 是 GT 元数据里主办方估计的细胞总数（estimated_number_of_nodes，含未标注细胞）。
+#   多报 10% 的节点，边 Jaccard 相对扣 1%；少报时系数大于 1（最多 1.1）。每多放一个节点都要靠正确的边“还账”，
+#   所以检测阈值偏高、删除短轨迹、找回阈值不宜太低，都是在控制节点数。
+def adjusted_jaccard(jaccard: float, t_pred: int, t_true, a: float = 0.1) -> float:
+    if not t_true or t_true <= 0:
+        return jaccard
+    return max(0.0, jaccard * (1.0 - a * (t_pred - t_true) / t_true))
+
+
+# 并查集（带路径减半）求预测图的弱连通分量（忽略边的方向），返回 节点 → 分量代表元。分裂项的旧判定要用它。
+def weakly_connected_components(node_ids, edges):
+    parent = {n: n for n in node_ids}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for s, t in edges:
+        if s in parent and t in parent:
+            union(s, t)
+    return {n: find(n) for n in node_ids}
+
+
+# 【4. 分裂项（旧规则的近似实现）】GT 里出度 ≥ 2 的节点是一次分裂。对每次 GT 分裂：
+#   · 锚点 = 母细胞及其 GT 上一帧节点所匹配到的预测节点（母细胞本身没匹配上时，靠上一帧的匹配点也能定位分量）；
+#   · 分别收集两个子细胞的全部 GT 后代（深度优先遍历）所匹配到的预测节点落在哪些弱连通分量里；
+#   · 若某个锚点所在的分量同时触及两个子代谱系、并且分量里确有一个出度 ≥ 2 的分叉，记 TP，否则记 FN。
+#   FP：出度 ≥ 2 的预测分叉，其匹配的 GT 节点在 GT 中有子节点、却不是任何 TP 分裂的母细胞。
+#   和边项一样，落在未标注区域的分叉（匹配不到 GT，或匹配到的 GT 节点没有子节点标注）不计 FP。
+# 一个连通分量可以很大，所以这个旧规则比现行的“有向局部窗口”规则宽松得多。
+def compute_division_confusion(pred_nodes, pred_edges, gt_nodes, gt_edges, pred_to_gt, gt_to_pred):
+    gt_out: dict[int, set[int]] = {}
+    gt_in: dict[int, int] = {}
+    for s, t in gt_edges:
+        gt_out.setdefault(s, set()).add(t)
+        gt_in[t] = s
+
+    pred_out: dict[int, set[int]] = {}
+    for s, t in pred_edges:
+        pred_out.setdefault(s, set()).add(t)
+
+    pred_node_ids = list(pred_nodes.keys())
+    pred_edge_list = list(pred_edges)
+    components = weakly_connected_components(pred_node_ids, pred_edge_list)
+    fork_components = {
+        components[n] for n, outs in pred_out.items() if len(outs) >= 2 and n in components
+    }
+    gt_division_sources = [s for s, outs in gt_out.items() if len(outs) >= 2]
+
+    def lineage_descendants(root_child: int) -> set[int]:
+        seen = {root_child}
+        stack = [root_child]
+        while stack:
+            cur = stack.pop()
+            for nxt in gt_out.get(cur, ()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return seen
+
+    tp = 0
+    fn = 0
+    tp_gt_sources: set[int] = set()
+
+    for gsrc in gt_division_sources:
+        children = sorted(gt_out[gsrc])
+        if len(children) < 2:
+            continue
+        anchor_candidates = [gsrc]
+        if gsrc in gt_in:
+            anchor_candidates.append(gt_in[gsrc])
+        anchor_pred_nodes = [gt_to_pred[a] for a in anchor_candidates if a in gt_to_pred]
+
+        lineage_hit_components: list[set[int]] = []
+        ok = True
+        for child in children[:2]:
+            lineage = lineage_descendants(child)
+            hit_comp_ids = {
+                components[p_id]
+                for gt_id in lineage
+                if (p_id := gt_to_pred.get(gt_id)) is not None and p_id in components
+            }
+            if not hit_comp_ids:
+                ok = False
+                break
+            lineage_hit_components.append(hit_comp_ids)
+
+        if not ok or not anchor_pred_nodes:
+            fn += 1
+            continue
+
+        anchor_comp_ids = {components[p] for p in anchor_pred_nodes if p in components}
+        if not anchor_comp_ids:
+            fn += 1
+            continue
+
+        found = any(
+            comp_id in lineage_hit_components[0]
+            and comp_id in lineage_hit_components[1]
+            and comp_id in fork_components
+            for comp_id in anchor_comp_ids
+        )
+        if found:
+            tp += 1
+            tp_gt_sources.add(gsrc)
+        else:
+            fn += 1
+
+    fp = 0
+    for n, outs in pred_out.items():
+        if len(outs) < 2:
+            continue
+        g = pred_to_gt.get(n)
+        if g is None or g not in gt_out or g in tp_gt_sources:
+            continue
+        fp += 1
+
+    return tp, fp, fn
+
+
+# 【5. 误差分解（诊断用，不进分数）】
+#   lost_to_detection：GT 边至少有一端没有匹配到预测节点，属于检测的问题；
+#   fragmented：两端都匹配到了，但预测图里这两点之间没有边，轨迹断开（碎片化）；
+#   recovered：被恢复的 GT 边；
+#   wrong_association：两端都匹配到 GT 节点、但 GT 里这两点之间没有边的预测边，属于关联错误。
+#     口径与计分用的 FP 不同：只有一端匹配上的冲突边（计分时算 FP）这里不算；反过来，两端 GT 节点都没有相应标注
+#     （源端没有子节点、目标端没有父节点）的错连边，计分时被忽略，这里却会算进来。
+def decompose_errors(pred_nodes, gt_nodes, pred_edges, gt_edges, pred_to_gt, gt_to_pred):
+    """误差分解：用与 compute_edge_confusion 完全相同的节点匹配，把剩余误差拆成“检测 / 碎片化 / 错误关联”三类
+    （分裂误差已由 compute_division_confusion 单独统计），用来判断下一步的提升空间在检测、连边还是断轨上。"""
+    gt_edge_set = set(gt_edges)
+    pred_edge_set = set(pred_edges)
+    gt_outgoing: dict[int, set[int]] = {}
+    for s, t in gt_edge_set:
+        gt_outgoing.setdefault(s, set()).add(t)
+
+    missed_gt_nodes = sum(1 for g in gt_nodes if g not in gt_to_pred)
+    spurious_pred_nodes = sum(1 for p in pred_nodes if p not in pred_to_gt)
+
+    recovered = fragmented = lost_to_detection = 0
+    for gs, gtid in gt_edge_set:
+        ps, pt = gt_to_pred.get(gs), gt_to_pred.get(gtid)
+        if ps is None or pt is None:
+            lost_to_detection += 1
+        elif (ps, pt) in pred_edge_set:
+            recovered += 1
+        else:
+            fragmented += 1
+
+    wrong_association = 0
+    for ps, pt in pred_edge_set:
+        ms, mt = pred_to_gt.get(ps), pred_to_gt.get(pt)
+        if ms is not None and mt is not None and mt not in gt_outgoing.get(ms, ()):
+            wrong_association += 1
+
+    return {
+        "missed_gt_nodes": missed_gt_nodes,
+        "spurious_pred_nodes": spurious_pred_nodes,
+        "edges_recovered": recovered,
+        "edges_fragmented": fragmented,
+        "edges_lost_to_detection": lost_to_detection,
+        "wrong_association_edges": wrong_association,
+    }
+
+
+# 从 GT 的 .geff 元数据（zarr v3 的 zarr.json 或 v2 的 .zattrs）里递归查找 estimated_number_of_nodes，
+#   也就是节点数调整中的 T_true。它包括未标注的细胞，所以远大于 GT 中实际标注的节点数。
+def _find_key_recursive(obj, key):
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            found = _find_key_recursive(v, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_key_recursive(item, key)
+            if found is not None:
+                return found
+    return None
+
+
+def read_estimated_true_node_count(geff_path: Path):
+    for candidate in (geff_path / "zarr.json", geff_path / ".zattrs"):
+        if not candidate.exists():
+            continue
+        try:
+            payload = json.loads(candidate.read_text())
+        except Exception:
+            continue
+        found = _find_key_recursive(payload, "estimated_number_of_nodes")
+        if found is not None:
+            try:
+                return float(found)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+# 把图转成最简单的结构：{节点 id: (t, z, y, x)} 和 [(源 id, 目标 id), ...]，供上面的指标函数使用。
+#   graph_to_plain 读 .geff 图对象，nodes_by_id_to_plain 读后处理输出的节点字典。
+def graph_to_plain(graph):
+    nodes: dict[int, tuple] = {}
+    for row in graph.node_attrs().iter_rows(named=True):
+        node_id = int(row["node_id"])
+        nodes[node_id] = (int(row["t"]), float(row["z"]), float(row["y"]), float(row["x"]))
+    edges: list[tuple[int, int]] = []
+    for row in graph.edge_attrs().iter_rows(named=True):
+        edges.append((int(row["source_id"]), int(row["target_id"])))
+    return nodes, edges
+
+
+def nodes_by_id_to_plain(nodes_by_id):
+    return {nid: (int(n["t"]), float(n["z"]), float(n["y"]), float(n["x"])) for nid, n in nodes_by_id.items()}
+
+
+# 单段影像打分：匹配 → 边 TP/FP/FN → J 与 adj → 分裂 TP/FP/FN → 误差分解。weight = TP + FP + FN 供跨影像加权。
+def score_sample(pred_nodes_plain, pred_edges_plain, gt_nodes_plain, gt_edges_plain, t_true):
+    p2g, g2p = match_nodes_bipartite(pred_nodes_plain, gt_nodes_plain, max_dist=VALIDATOR_MATCH_RADIUS_UM)
+    tp, fp, fn = compute_edge_confusion(pred_edges_plain, gt_edges_plain, p2g, g2p)
+    jac = edge_jaccard(tp, fp, fn)
+    t_pred = len(pred_nodes_plain)
+    adj = adjusted_jaccard(jac, t_pred, t_true, a=VALIDATOR_NODE_COUNT_PENALTY_A)
+    div_tp, div_fp, div_fn = compute_division_confusion(
+        pred_nodes_plain, pred_edges_plain, gt_nodes_plain, gt_edges_plain, p2g, g2p
+    )
+    errors = decompose_errors(pred_nodes_plain, gt_nodes_plain, pred_edges_plain, gt_edges_plain, p2g, g2p)
+    div_jac = edge_jaccard(div_tp, div_fp, div_fn)
+    row = {
+        "edge_tp": tp, "edge_fp": fp, "edge_fn": fn, "edge_jaccard": jac,
+        "t_pred": t_pred, "t_true": t_true, "adjusted_edge_jaccard": adj,
+        "div_tp": div_tp, "div_fp": div_fp, "div_fn": div_fn, "div_jaccard": div_jac,
+        "weight": tp + fp + fn,
+    }
+    row.update(errors)
+    return row
+
+
+# 【6. 跨影像聚合（与官方一致）】adj 按每段影像的 TP+FP+FN 加权平均（GT 边多的影像权重大）；
+#   分裂项把所有影像的 TP/FP/FN 先相加、再算一次 Jaccard（micro 平均）：单段影像的分裂太少，逐段算 Jaccard 噪声极大；
+#   代理总分 proxy_score = adj + 0.1 × 分裂 Jaccard。
+def aggregate_official(sample_rows):
+    total_w = sum(r["weight"] for r in sample_rows) or 1
+    weighted_adj = sum(r["adjusted_edge_jaccard"] * r["weight"] for r in sample_rows) / total_w
+    div_tp = sum(r["div_tp"] for r in sample_rows)
+    div_fp = sum(r["div_fp"] for r in sample_rows)
+    div_fn = sum(r["div_fn"] for r in sample_rows)
+    div_jac = edge_jaccard(div_tp, div_fp, div_fn)
+    return {
+        "adjusted_edge_jaccard": weighted_adj,
+        "division_jaccard": div_jac,
+        "proxy_score": weighted_adj + VALIDATOR_DIVISION_WEIGHT * div_jac,
+        "div_tp": div_tp, "div_fp": div_fp, "div_fn": div_fn,
+        "missed_gt_nodes": sum(r["missed_gt_nodes"] for r in sample_rows),
+        "spurious_pred_nodes": sum(r["spurious_pred_nodes"] for r in sample_rows),
+        "edges_recovered": sum(r["edges_recovered"] for r in sample_rows),
+        "edges_fragmented": sum(r["edges_fragmented"] for r in sample_rows),
+        "edges_lost_to_detection": sum(r["edges_lost_to_detection"] for r in sample_rows),
+        "wrong_association_edges": sum(r["wrong_association_edges"] for r in sample_rows),
+    }
+
+
+# ===== 第 9 段：后处理参数的临时替换 + 验证器的缓存与打分 =====
+# 原理：第 5 段的后处理函数在“调用时”才读取模块级全局常量（GAP_CLOSE_UM 等），所以只要临时改 globals()，
+#   同一个 filter_output_graph 就会用另一套参数运行，跑完再改回来。GPU 推理（最贵）只做一次，
+#   同一份原始 ILP 图可以在 CPU 上反复跑不同的后处理配置。第 11 段也用 pp_apply / pp_restore 保证各遍参数一致。
+import copy as _copy
+
+# 允许替换的 20 个后处理常量（白名单）：安全分裂的 7 个门限、DeepCenter 的 2 个否决阈值、缺口闭合距离、
+#   最短轨迹长度、短轨迹救回门限、重链接的紧 / 松门限、严格两帧缺口的单步与总长、学习奖励、速度权重、
+#   缺口闭合复用距离、输出边的最大长度（_UM 结尾的单位都是 µm）。
+PP_SWEEP_KEYS = [
+    "SAFE_DIV_MAX_UM", "SAFE_DIV_SISTER_MAX_UM", "SAFE_DIV_DIVERGE_UM",
+    "SAFE_DIV_SISTER_SYMMETRY_TAU", "SAFE_DIV_EXISTING_CHILD_MAX_UM",
+    "SAFE_DIV_FRAME_FRAC_CAP", "SAFE_DIV_GLOBAL_FRAC_CAP",
+    "DEEPCENTER_SAFE_DIV_THRESHOLD", "DEEPCENTER_GAP_THRESHOLD",
+    "GAP_CLOSE_UM", "OUTPUT_MIN_TRACK_LEN",
+    "SHORT_TRACK_RESCUE_MIN_MEAN_EDGE_PROB", "MOTION_RELINK_TIGHT_UM",
+    "MOTION_RELINK_RELAXED_UM", "GAP2_MAX_STEP_UM", "GAP2_MAX_TOTAL_UM",
+    "MOTION_RELINK_LEARNED_BONUS", "MOTION_RELINK_VELOCITY_WEIGHT",
+    "GAP_CLOSE_REUSE_UM", "OUTPUT_EDGE_MAX_UM",
+]
+# 基线配置 = 这些全局量的当前值（即第 0 段的设置）。打印文字里的 "public …" 是上游公开流水线自己的历史标签，
+#   与本方案无关。
+PP_BASE_CONFIG = {key: globals()[key] for key in PP_SWEEP_KEYS}
+print("Post-process base configuration (public 0.939):")
+for key in PP_SWEEP_KEYS:
+    print(f"  {key:<40} {PP_BASE_CONFIG[key]}")
+
+
+# pp_apply：先保存将被覆盖的旧值；只允许白名单里的键；按基线值的类型转换（int 仍是 int，float 仍是 float）；返回旧值。
+# pp_restore：把保存的旧值写回。调用方用 try / finally 包住，保证出错时参数也能复原。
+# 注意：超时降级改的 OUTPUT_* 开关不在白名单里，pp_restore 不会恢复它们（降级一旦发生就对之后的所有遍生效）。
+def pp_apply(config: dict) -> dict:
+    saved = {key: globals()[key] for key in config}
+    for key, value in config.items():
+        if key not in PP_SWEEP_KEYS:
+            raise KeyError(f"{key} is not a sweepable post-process constant")
+        globals()[key] = type(PP_BASE_CONFIG[key])(value)
+    return saved
+
+
+def pp_restore(saved: dict) -> None:
+    for key, value in saved.items():
+        globals()[key] = value
+
+
+# 验证器开启时：找到每段留出影像的原始 ILP 图（预测目录下的 <影像>.geff）和 GT，缓存进内存。
+#   原始图保留节点坐标、边和关联网络给出的 edge_prob（重链接把它当学习奖励）；
+#   GT 还要读出 estimated_number_of_nodes（节点数调整的分母），缺失就报错。
+VAL_RAW_GRAPHS: dict[str, tuple[dict, list]] = {}
+VAL_GT: dict[str, tuple[list, list, object]] = {}
+
+if VALIDATOR_ENABLE and val_stems:
+    val_pred_paths = {
+        stem: found
+        for stem in val_stems
+        if (found := next((REPO_DIR / "predictions").rglob(f"{stem}.geff"), None)) is not None
+    }
+    missing = [s for s in val_stems if s not in val_pred_paths]
+    if missing:
+        raise RuntimeError(f"VALIDATOR: no prediction .geff for {missing}")
+    for stem in val_stems:
+        gt_path = TRAIN_DIR / f"{stem}.geff"
+        if not gt_path.exists():
+            raise RuntimeError(f"VALIDATOR: missing GT {gt_path}")
+        gt_graph = graph_from_geff(gt_path)
+        gt_nodes_plain, gt_edges_plain = graph_to_plain(gt_graph)
+        t_true = read_estimated_true_node_count(gt_path)
+        if t_true is None:
+            raise RuntimeError(f"VALIDATOR: estimated_number_of_nodes missing for {stem}")
+        VAL_GT[stem] = (gt_nodes_plain, gt_edges_plain, t_true)
+
+        pred_graph = graph_from_geff(val_pred_paths[stem])
+        raw_nodes_by_id: dict[int, dict[str, object]] = {}
+        for row in pred_graph.node_attrs().iter_rows(named=True):
+            node_id = int(row["node_id"])
+            raw_nodes_by_id[node_id] = {
+                "node_id": node_id, "t": int(row["t"]),
+                "z": float(row["z"]), "y": float(row["y"]), "x": float(row["x"]),
+            }
+        raw_edges = []
+        for row in pred_graph.edge_attrs().iter_rows(named=True):
+            edge_prob = row.get("edge_prob") if hasattr(row, "get") else None
+            raw_edges.append({
+                "source_id": int(row["source_id"]), "target_id": int(row["target_id"]),
+                "edge_prob": None if edge_prob is None else float(edge_prob),
+            })
+        VAL_RAW_GRAPHS[stem] = (raw_nodes_by_id, raw_edges)
+    print(f"VALIDATOR: cached {len(VAL_RAW_GRAPHS)} raw prediction graphs + GT")
+
+
+# 用一组覆盖值 config 在全部留出影像上跑完整后处理，并按官方公式打分。每次都从原始图的深拷贝开始，各配置互不影响。
+#   后处理里凡是要看原始影像的步骤（DeepCenter 中心热图否决、合成中点的亮度质心精修、分裂补全打分器的图像特征）
+#   都通过 read_test_frame 读 TEST_DIR/<影像>.zarr，所以这里临时把全局 TEST_DIR 指向训练目录，finally 里再改回来。
+#   这里直接调用 filter_output_graph、不经过 write_test_submission，所以不受运行时限检查和逐片兜底的影响。
+def score_validator_config(config: dict, label: str, verbose: bool = False) -> tuple[dict, list]:
+    """用覆盖值 config 对每段已缓存的留出影像跑完整后处理，并按官方指标公式打分。"""
+    saved = pp_apply(config)
+    _real_test_dir = TEST_DIR
+    globals()["TEST_DIR"] = TRAIN_DIR
+    rows = []
+    t0 = time.time()
+    try:
+        for stem in val_stems:
+            raw_nodes_by_id, raw_edges = VAL_RAW_GRAPHS[stem]
+            nodes_copy = _copy.deepcopy(raw_nodes_by_id)
+            edges_copy = _copy.deepcopy(raw_edges)
+            processed_nodes, processed_edges, _stage_stats = filter_output_graph(
+                nodes_copy, edges_copy, dataset=stem,
+                deepcenter_bundle=globals().get("DEEPCENTER_VETO_DETECTOR"),
+            )
+            gt_nodes_plain, gt_edges_plain, t_true = VAL_GT[stem]
+            pred_nodes_plain = nodes_by_id_to_plain(processed_nodes)
+            pred_edges_plain = [(int(e["source_id"]), int(e["target_id"])) for e in processed_edges]
+            row = score_sample(pred_nodes_plain, pred_edges_plain, gt_nodes_plain, gt_edges_plain, t_true)
+            row["stem"] = stem
+            row["config"] = label
+            row["safe_divisions_added"] = _stage_stats.get("safe_divisions_added", 0)
+            rows.append(row)
+    finally:
+        globals()["TEST_DIR"] = _real_test_dir
+        pp_restore(saved)
+    summary = aggregate_official(rows)
+    summary["n_samples"] = len(rows)
+    summary["config"] = label
+    summary["seconds"] = time.time() - t0
+    if verbose:
+        for row in rows:
+            print(f"  {row['stem']:<28} edge_jaccard={row['edge_jaccard']:.4f} "
+                  f"adj={row['adjusted_edge_jaccard']:.4f} T_pred={row['t_pred']} T_true={row['t_true']} "
+                  f"div(tp/fp/fn)=({row['div_tp']}/{row['div_fp']}/{row['div_fn']}) "
+                  f"safe_div_added={row['safe_divisions_added']}")
+    print(f"[{label}] n={summary['n_samples']} adjusted_edge_jaccard={summary['adjusted_edge_jaccard']:.4f} "
+          f"division_jaccard={summary['division_jaccard']:.4f} (tp/fp/fn={summary['div_tp']}/{summary['div_fp']}/{summary['div_fn']}) "
+          f"PROXY_SCORE={summary['proxy_score']:.4f}  [{summary['seconds']/60:.1f} min]")
+    return summary, rows
+
+
+# 验证器开启时先给基线配置打分，逐影像结果写进 validator_results.csv；最终版本中验证器关闭，只打印 skipping。
+#   下面打印的 "public …" 同样是上游公开流水线的历史标签；网址是主办方公开的官方指标说明。
+validator_sample_rows: list[dict[str, object]] = []
+validator_summary_rows: list[dict[str, object]] = []
+PP_RESULTS: dict[str, dict] = {}
+
+if VALIDATOR_ENABLE and val_stems:
+    print()
+    print("=" * 78)
+    print("LOCAL VALIDATOR -- base configuration (public 0.939), official metric formula")
+    print("(https://github.com/royerlab/kaggle-cell-tracking-competition/blob/main/metrics.md)")
+    print("=" * 78)
+    base_summary, base_rows = score_validator_config({}, "base", verbose=True)
+    PP_RESULTS["base"] = base_summary
+    validator_sample_rows.extend(base_rows)
+    validator_summary_rows.append(base_summary)
+    with VALIDATOR_STATS_PATH.open("w", newline="") as f:
+        fieldnames = sorted({k for row in base_rows for k in row.keys()})
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in base_rows:
+            writer.writerow(row)
+    print(f"Per-sample validator rows written to {VALIDATOR_STATS_PATH}")
+else:
+    print("VALIDATOR: disabled or no held-out samples available -- skipping scoring.")
+
+
+# ===== 第 10 段：留出集上的后处理参数选择（最终版本中不运行）+ 第一遍提交的最终断言 =====
+# 选择规则：每个候选只改一个旋钮。分裂事件很少、方差很大，只看总分最高很容易把噪声当成信号，所以设两道门槛：
+#   1) 代理总分至少比基线高 PP_SELECT_MARGIN（代码默认 0.002，第 0 段设为 0.001）；
+#   2) adj（边项，确定性更强）的下降不超过 PP_MAX_ADJ_LOSS = 0.0005：不允许用确定的边损失去换随机的分裂波动。
+# 最终版本中验证器关闭，这里保持基线配置（selected_config = {}）。候选里的 tight55（重链接紧门限 5.5 µm）
+#   正是上游公开流水线用这套流程选出、后来写死在第 0 段的值，所以它现在已经和基线相同。
+
+# 7 个单旋钮候选：键是标签，值是要覆盖的参数（距离单位 µm）。
+PP_CANDIDATES: dict[str, dict] = {
+    "gap45": {"GAP_CLOSE_UM": 4.5},
+    "tight55": {"MOTION_RELINK_TIGHT_UM": 5.5},
+    "relaxed9": {"MOTION_RELINK_RELAXED_UM": 9.0},
+    "bonus125": {"MOTION_RELINK_LEARNED_BONUS": 1.25},
+    "gap2step40": {"GAP2_MAX_STEP_UM": 4.0},
+    "reuse28": {"GAP_CLOSE_REUSE_UM": 2.8},
+    "dcgap035": {"DEEPCENTER_GAP_THRESHOLD": 0.35},
+}
+PP_SELECT_MARGIN = float(os.environ.get("BIOHUB_PPSWEEP_SELECT_MARGIN", "0.002"))
+PP_MAX_ADJ_LOSS = float(os.environ.get("BIOHUB_PPSWEEP_MAX_ADJ_LOSS", "0.0005"))
+PP_SWEEP_RESULTS_PATH = WORKING_DIR / "ppsweep_results.csv"
+PP_SELECTED_PATH = WORKING_DIR / "ppsweep_selected.json"
+
+# 默认：基线配置，不覆盖任何参数。
+selected_label = "base"
+selected_config: dict = {}
+
+if VALIDATOR_ENABLE and val_stems and "base" in PP_RESULTS:
+    base_summary = PP_RESULTS["base"]
+    print("=" * 78)
+    print(f"POST-PROCESS SWEEP -- {len(PP_CANDIDATES)} candidates x {len(val_stems)} held-out videos")
+    print("=" * 78)
+    for label, config in PP_CANDIDATES.items():
+        summary, rows = score_validator_config(config, label)
+        PP_RESULTS[label] = summary
+        validator_sample_rows.extend(rows)
+
+    # 先筛出单独有效的候选（代理分 ≥ 基线 + 0.0005，且 adj 下降不超过 PP_MAX_ADJ_LOSS），按代理分从高到低把它们的
+    #   覆盖值合成一个组合（同一参数先到先得）。组合必须重新实测：各单项的收益不一定能相加。
+    positive = [
+        label for label, summary in PP_RESULTS.items()
+        if label != "base"
+        and summary["proxy_score"] >= base_summary["proxy_score"] + 0.0005
+        and summary["adjusted_edge_jaccard"] >= base_summary["adjusted_edge_jaccard"] - PP_MAX_ADJ_LOSS
+    ]
+    positive.sort(key=lambda l: PP_RESULTS[l]["proxy_score"], reverse=True)
+    combo_config: dict = {}
+    for label in positive:
+        for key, value in PP_CANDIDATES[label].items():
+            combo_config.setdefault(key, value)
+    if len(positive) >= 2:
+        combo_label = "combo(" + "+".join(positive) + ")"
+        summary, rows = score_validator_config(combo_config, combo_label)
+        PP_RESULTS[combo_label] = summary
+        PP_CANDIDATES[combo_label] = combo_config
+        validator_sample_rows.extend(rows)
+
+    print()
+    print("=" * 78)
+    print("SWEEP TABLE (sorted by PROXY_SCORE)")
+    print("=" * 78)
+    ranked = sorted(PP_RESULTS.items(), key=lambda kv: kv[1]["proxy_score"], reverse=True)
+    for label, summary in ranked:
+        delta = summary["proxy_score"] - base_summary["proxy_score"]
+        print(f"  {label:<40} proxy={summary['proxy_score']:.4f} ({delta:+.4f})  "
+              f"adj={summary['adjusted_edge_jaccard']:.4f}  divJ={summary['division_jaccard']:.4f} "
+              f"(tp/fp/fn={summary['div_tp']}/{summary['div_fp']}/{summary['div_fn']})")
+    pd.DataFrame([
+        {"config": label, **{k: v for k, v in summary.items() if k != "config"},
+         "overrides": json.dumps(PP_CANDIDATES.get(label, {}), sort_keys=True)}
+        for label, summary in ranked
+    ]).to_csv(PP_SWEEP_RESULTS_PATH, index=False)
+
+    # 最终选择：排名第一的配置不是基线、代理分比基线至少高 PP_SELECT_MARGIN、且 adj 下降不超过 PP_MAX_ADJ_LOSS，才采用。
+    best_label, best_summary = ranked[0]
+    if (
+        best_label != "base"
+        and best_summary["proxy_score"] >= base_summary["proxy_score"] + PP_SELECT_MARGIN
+        and best_summary["adjusted_edge_jaccard"] >= base_summary["adjusted_edge_jaccard"] - PP_MAX_ADJ_LOSS
+    ):
+        selected_label = best_label
+        selected_config = dict(PP_CANDIDATES[best_label])
+    print()
+    print(f"SELECTED: {selected_label}  overrides={selected_config}  "
+          f"(margin rule: >= +{PP_SELECT_MARGIN} proxy and adj loss <= {PP_MAX_ADJ_LOSS})")
+    print(f"  base     proxy={base_summary['proxy_score']:.4f} adj={base_summary['adjusted_edge_jaccard']:.4f} divJ={base_summary['division_jaccard']:.4f}")
+    sel = PP_RESULTS[selected_label]
+    print(f"  selected proxy={sel['proxy_score']:.4f} adj={sel['adjusted_edge_jaccard']:.4f} divJ={sel['division_jaccard']:.4f}")
+
+    with VALIDATOR_STATS_PATH.open("w", newline="") as f:
+        fieldnames = sorted({k for row in validator_sample_rows for k in row.keys()})
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in validator_sample_rows:
+            writer.writerow(row)
+else:
+    print("SWEEP: validator unavailable -- keeping the base configuration.")
+
+# 不论验证器是否开启都写出选择结果（最终版本中为 selected = "base"、overrides = {}），方便事后核查。
+PP_SELECTED_PATH.write_text(json.dumps({
+    "selected": selected_label,
+    "overrides": selected_config,
+    "base_proxy": PP_RESULTS.get("base", {}).get("proxy_score"),
+    "selected_proxy": PP_RESULTS.get(selected_label, {}).get("proxy_score"),
+    "held_out_stems": list(val_stems),
+}, indent=2, sort_keys=True) + "\n")
+
+# 若选中了非基线配置：用它重写 submission.csv，并把选中值写回 BIOHUB_* 环境变量，让之后的子进程和第 12 段的清单
+#   看到同一套配置。最终版本中 selected_config 为空，直接保留第一遍的 submission.csv
+#   （打印里的 "public …" 是上游公开流水线的历史标签）。
+if selected_config:
+    print()
+    print(f"Re-writing submission.csv with the selected post-process configuration: {selected_label}")
+    _saved = pp_apply(selected_config)
+    try:
+        write_test_submission(selected_label)
+    finally:
+        pp_restore(_saved)
+    for key, value in selected_config.items():
+        os.environ["BIOHUB_" + key] = str(value)
+else:
+    print("Keeping the base submission.csv (public 0.939 configuration).")
+
+
+# 对当前的 submission.csv（第一遍的结果）再做一次断言：列名、id 连续、影像集合、每条边恰好跨一帧、单父、至多两子，
+#   并打印每段影像的节点 / 边 / 分裂数。第 11 段的最终一遍会覆盖这个文件，这组拓扑断言不会对最终文件再跑一次；
+#   最终文件由 write_test_submission 内部的检查（无悬空边、影像集合、表头、行数）和第 11 段读回 CSV 时的列名检查把关。
+_final = pd.read_csv(SUBMISSION_PATH)
+assert _final.columns.tolist() == CSV_COLUMNS, _final.columns.tolist()
+assert _final["id"].tolist() == list(range(len(_final))), "row ids not contiguous"
+_expected_sets = sorted(p.name[:-5] for p in TEST_DIR.iterdir() if p.name.endswith(".zarr"))
+assert sorted(_final["dataset"].astype(str).unique()) == _expected_sets, "dataset mismatch"
+for _ds, _grp in _final.groupby("dataset"):
+    _n = _grp[_grp.row_type.eq("node")]
+    _e = _grp[_grp.row_type.eq("edge")]
+    _t = dict(zip(_n.node_id.astype(int), _n.t.astype(int)))
+    assert all(_t[int(s)] + 1 == _t[int(d)] for s, d in zip(_e.source_id, _e.target_id)), f"{_ds}: bad edge time"
+    assert _e.target_id.value_counts().max() <= 1, f"{_ds}: multi-parent"
+    assert _e.source_id.value_counts().max() <= 2, f"{_ds}: out-degree > 2"
+    print(f"  {_ds}: nodes={len(_n)} edges={len(_e)} divisions={(_e.source_id.value_counts() == 2).sum()}")
+print(f"Final submission.csv rows={len(_final)}  config={selected_label}")
+
+
+# ===== 第 11 段：两遍后处理——参照一遍、可见集诊断、最终一遍（写出提交文件）与报告 =====
+# 整体编排。GPU 推理只在第 4 段做了一次；下面每一遍都只是在同一批 ILP 结果图（.geff）上重新跑 CPU 后处理，
+#   每遍都会重写同一个 submission.csv 和 run_stats.csv：
+#   · 参照一遍：就是第 5 段末尾的 write_test_submission("base")。五个新模块开关全关，后处理等于公开基线，
+#     本段开头把它另存为参照 CSV。严格说它并不是原样的公开基线：ILP 分裂权重 0.4、找回阈值 0.94 和
+#     10 折坐标头作用在推理或每一遍的后处理里，参照一遍里同样生效。
+#   · 可见集诊断一遍：只在测试目录恰好是 4 段可见影像时（Kaggle 的保存运行）执行，隐藏集重跑时自动跳过。
+#   · 最终一遍：打开全部新模块，覆盖 submission.csv，这才是提交的内容。
+# 为什么还要跑参照一遍：两遍只差模块开关，逐段对比两份 CSV 就能看出新模块改了多少节点和边，在保存运行时确认
+#   模块确实生效。各遍之间没有数据依赖（每遍都重新读 .geff，稠密候选缓存只读），会影响输出的跨遍全局状态只有超时降级。
+#   最终一遍无条件执行，不看本地代理分（验证器本来也已关闭）。
+# 运行时限：隐藏集有上百段影像（主办方说规模与训练集相近），GPU 推理已占去大量时间，后处理还要跑两遍，
+#   所以第 0 段把 REPAIR_DEADLINE_S 设为 41400 s（11.5 h，竞赛上限 12 h）。write_test_submission 在每段影像
+#   开始前检查时限，超时后调用 _deadline_degrade 关闭重链接、缺口闭合、严格两帧缺口、安全分裂、线拟合平滑
+#   这些可选步骤，而且对之后的所有影像、所有遍永久生效。
+#   公开基线的时限是 7.5 h（27000 s，也是代码里的默认值），对两遍后处理来说太短：隐藏集上第二遍可能中途触发降级，
+#   剩余影像就不再做重链接、缺口闭合、安全分裂和平滑，分数悄悄变差而 notebook 照常成功。
+
+import hashlib as _dr_hashlib
+import shutil as _dr_shutil
+from collections import Counter as _DRCounter
+
+# 保存参照：此刻的 submission.csv / run_stats.csv 还是第一遍的结果，复制成 x138_original_reference.csv 和
+#   x138_original_run_stats.csv（文件名里的 x138 指公开基线）；后面的诊断遍和最终一遍都会覆盖原文件。
+_DR_BASE_CSV = WORKING_DIR / "x138_original_reference.csv"
+_dr_shutil.copy2(SUBMISSION_PATH, _DR_BASE_CSV)
+_DR_BASE_STATS = WORKING_DIR / "x138_original_run_stats.csv"
+if RUN_STATS_PATH.is_file():
+    _dr_shutil.copy2(RUN_STATS_PATH, _DR_BASE_STATS)
+
+# 验证器开启时：在留出的训练影像上，分别关闭 / 打开候选概率重链接各打一次分（其余新模块保持关闭），作为本地对照；
+#   报告里的 metric_note 说明这里的分裂项是旧规则，不是现行官方分裂指标。
+#   最终版本中验证器关闭，这段不运行，_DR_VAL = {"available": False}。
+_DR_VAL = {"available": False}
+if VALIDATOR_ENABLE and val_stems and VAL_RAW_GRAPHS:
+    _DR_ACTIVE = False
+    _dr_ref_summary, _dr_ref_rows = score_validator_config(selected_config, "x138_reference")
+    _DR_ACTIVE = True
+    try:
+        _dr_new_summary, _dr_new_rows = score_validator_config(selected_config, "x138_candidate_relink")
+    finally:
+        _DR_ACTIVE = False
+    _DR_VAL = {
+        "available": True,
+        "metric_note": "existing x138 local proxy; division component is not the official division metric",
+        "reference": _dr_ref_summary,
+        "candidate_relink": _dr_new_summary,
+        "per_video": {
+            stem: {
+                "reference": next(r for r in _dr_ref_rows if r["stem"] == stem),
+                "candidate_relink": next(r for r in _dr_new_rows if r["stem"] == stem),
+            }
+            for stem in val_stems
+        },
+    }
+
+# 【可见集诊断一遍】只有测试影像恰好是 4 段可见影像（Kaggle 的保存运行）时才执行；隐藏集重跑时影像不同，自动跳过、不占时间。
+#   这一遍打开候选概率重链接、全局位移估计 + 跳变感知平滑、关联特征修正、找回概率打分，只关闭分裂补全打分器，
+#   结果另存为 diagnostic_modules_off.csv（modules_off 指最后加入的分裂补全打分器处于关闭状态）。
+#   拿它和最终 CSV 逐段对比，就能单独看出分裂补全打分器在可见集上改了哪些边。
+#   变量名前缀 D4RR 沿用开发时的叫法：D4 = 关联特征修正，RR = 找回概率打分。
+# 可见的 4 段影像是训练集同名影像的逐像素副本，GT 分裂只有 3 个，所以这一遍只用来核对改动，不用来比较分数。
+# _MOD_EXPECTED_BASE_SHA 是更早一个版本在可见集上的输出指纹：那个版本的后处理模块与这一遍相同，但坐标头、
+#   ILP 分裂权重、找回阈值还是公开基线的设置。本版本这三项在每一遍都已改变，所以 modules_off_matches_base
+#   按设计为 False：只记录，不断言。
+_D4RR_VISIBLE_STEMS = {"44b6_0113de3b", "44b6_0b24845f", "6bba_05b6850b", "6bba_05db0fb1"}
+_MOD_EXPECTED_BASE_SHA = "83214a3c588d1b4b33565d3a979ce35569c6e4edddb151e9348590a7540a0b36"
+_D4RR_DIAG = {"ran": False}
+if set(map(str, test_stems)) == _D4RR_VISIBLE_STEMS:
+    _D4RR_DIAG["ran"] = True
+    _DR_ACTIVE = True
+    _G1X1_ACTIVE = True
+    _D4_ACTIVE = True
+    _RR_ACTIVE = True
+    _D1_ACTIVE = False
+    # 与参照一遍用同一套后处理参数（selected_config 为空）；try / finally 保证无论成败，模块开关和参数都会复位。
+    _mod_saved_pp = pp_apply(selected_config)
+    try:
+        write_test_submission("diagnostic_modules_off")
+    finally:
+        _DR_ACTIVE = False
+        _G1X1_ACTIVE = False
+        _D4_ACTIVE = False
+        _RR_ACTIVE = False
+        _D1_ACTIVE = False
+        pp_restore(_mod_saved_pp)
+    # write_test_submission 每遍都写同一个 submission.csv，所以要马上把诊断结果复制出来，随后由最终一遍覆盖。
+    _mod_csv = WORKING_DIR / "diagnostic_modules_off.csv"
+    _dr_shutil.copy2(SUBMISSION_PATH, _mod_csv)
+    _dr_shutil.copy2(RUN_STATS_PATH, WORKING_DIR / "diagnostic_modules_off_run_stats.csv")
+    # 记录诊断 CSV 的 sha256，并与上面的固定指纹比较（结果只写进报告）。
+    _D4RR_DIAG["modules_off"] = _dr_hashlib.sha256(_mod_csv.read_bytes()).hexdigest()
+    _D4RR_DIAG["modules_off_matches_base"] = _D4RR_DIAG["modules_off"] == _MOD_EXPECTED_BASE_SHA
+    print("Visible diagnostics:", _D4RR_DIAG)
+
+# 【最终一遍：决定提交内容的唯一一遍】五个模块开关全部打开；filter_output_graph 在运行时读取这些全局开关：
+#   _DR_ACTIVE    候选概率重链接：读取推理时缓存的稠密候选对（每个目标细胞 10 µm 内的全部候选 ∪ 概率前 12 的候选）
+#                 的模型概率，并入重链接的学习奖励；公开基线只给 ILP 选中的边带概率，其余配对一律当作 0。
+#                 缓存文件缺失、没有可用的概率、或距离 ≤ 9.9 µm 的 ILP 边被缓存覆盖不足 90%（说明节点编号对不上）
+#                 都会抛异常，这段影像随即走逐片兜底（fallback_output_graph）。
+#   _G1X1_ACTIVE  全局位移估计：某帧对里整个视野一起平移 ≥ 3 µm 时（15 µm 内全部配对的位移直方图取众数，再取众数
+#                 附近位移的中位数；真配对堆在同一格，错配对散布各处，所以不需要链接概率），用这个全局位移作为
+#                 重链接种子轮的预测位移，代替上一帧对的邻居位移场（后者预料不到整帧跳变）；
+#                 + 跳变感知平滑：输出边的位移中位数 ≥ 3 µm 的帧对视为整帧跳变，线拟合前先扣除跳变的累计位移、
+#                 拟合后再加回，不把跳变台阶抹平；
+#   _D4_ACTIVE    关联特征修正：重链接改用缓存里的 d4_prob 代替 prob（只在候选概率重链接打开时起作用）。
+#                 公开代码 8 视角特征 TTA 里的“反转置”视角其实与 x 翻转重复，d4_prob 是换成真正的反转置后
+#                 重算的关联概率；
+#   _RR_ACTIVE    找回概率打分：被找回的节点映射回它原来的检测候选（最近者 ≤ 2 µm、且比次近者至少近 1 µm、
+#                 不与别的节点争同一个候选），继承该候选的模型概率（否则概率为 0）；同样要求候选概率重链接打开；
+#   _D1_ACTIVE    分裂补全打分器：在安全分裂之后，给“只有一个子细胞的母细胞 + 下一帧无父轨迹起点”打分，
+#                 超过阈值就补上第二条子边（只增不删）。
+# 前四个模块都依附于重链接或线拟合平滑这些可选步骤：一旦触发超时降级，它们会随之失效；分裂补全打分器
+#   挂在安全分裂这一步上，但不受降级开关控制（安全分裂被关掉后它照常运行）。
+_DR_ACTIVE = True
+_G1X1_ACTIVE = True
+_D4_ACTIVE = True
+_RR_ACTIVE = True
+_D1_ACTIVE = True
+# 与参照一遍用同一份后处理参数（selected_config 为空），两遍的差异只来自模块开关。
+# write_test_submission 重写 submission.csv 与 run_stats.csv。传入的标签字符串（final_all_modules = 全部新模块
+#   打开的最终一遍）只写进 run_stats.csv 的 experiment_tag 列，不影响任何计算。
+#   对每段影像读 .geff →（检查运行时限）→ filter_output_graph → 写节点行和边行。CSV 的写法：
+#   节点行填 node_id、t 和用 round() 取整后的体素下标 z / y / x（负值截到 0），source_id / target_id 填 -1；
+#   边行只填 source_id → target_id（t 帧指向 t+1 帧），其余列填 -1；id 是全表连续行号。
+#   某段影像后处理抛异常时，这段改用 fallback_output_graph（只保留 ILP 图里相邻帧、不过长的边，单父、至多两子），
+#   保证一定能写出结果。try / finally 保证无论成败，开关和参数都会复位。
+# Kaggle 评分只读取 /kaggle/working/submission.csv；这一遍是最后一次写它，所以提交的就是最终一遍的结果。
+_dr_saved_pp = pp_apply(selected_config)
+try:
+    write_test_submission("final_all_modules")
+finally:
+    _DR_ACTIVE = False
+    _G1X1_ACTIVE = False
+    _D4_ACTIVE = False
+    _RR_ACTIVE = False
+    _D1_ACTIVE = False
+    pp_restore(_dr_saved_pp)
+
+# 逐段对比参照 CSV 与最终 CSV：把 CSV 读成 {影像: (节点 {id: (t, z, y, x)}, 边集合)}。
+#   节点按 id 比较取整后的坐标（nodes_moved：坐标被平滑或精修移动过），边按 (源, 目标) 集合比较，
+#   并统计两版的分裂母节点数（出度 ≥ 2）。用来确认新模块确实生效、改动量在合理范围内。
+def _dr_graph_signature(path):
+    frame = pd.read_csv(path)
+    if frame.columns.tolist() != CSV_COLUMNS:
+        raise AssertionError(f"Unexpected submission schema: {path}")
+    result = {}
+    for stem, group in frame.groupby("dataset", sort=False):
+        nodes = {
+            int(row.node_id): (int(row.t), int(row.z), int(row.y), int(row.x))
+            for row in group[group.row_type.eq("node")].itertuples(index=False)
+        }
+        edges = {
+            (int(row.source_id), int(row.target_id))
+            for row in group[group.row_type.eq("edge")].itertuples(index=False)
+        }
+        result[str(stem)] = (nodes, edges)
+    return result
+
+_dr_ref_graphs = _dr_graph_signature(_DR_BASE_CSV)
+_dr_new_graphs = _dr_graph_signature(SUBMISSION_PATH)
+if set(_dr_ref_graphs) != set(_dr_new_graphs):
+    raise AssertionError("Reference and experiment cover different videos")
+_DR_GRAPH_DIFF = {}
+for stem in sorted(_dr_ref_graphs):
+    old_nodes, old_edges = _dr_ref_graphs[stem]
+    new_nodes, new_edges = _dr_new_graphs[stem]
+    _DR_GRAPH_DIFF[stem] = {
+        "nodes_added": len(new_nodes.keys() - old_nodes.keys()),
+        "nodes_removed": len(old_nodes.keys() - new_nodes.keys()),
+        "nodes_moved": sum(old_nodes[k] != new_nodes[k] for k in old_nodes.keys() & new_nodes.keys()),
+        "edges_added": len(new_edges - old_edges),
+        "edges_removed": len(old_edges - new_edges),
+        "edge_symmetric_difference": len(new_edges ^ old_edges),
+        "reference_division_parents": sum(
+            count >= 2 for count in _DRCounter(s for s, _ in old_edges).values()
+        ),
+        "experiment_division_parents": sum(
+            count >= 2 for count in _DRCounter(s for s, _ in new_edges).values()
+        ),
+    }
+
+# 读最终一遍的逐影像统计（run_stats.csv），下面的报告从中挑选各模块的计数列。
+_dr_final_stats = pd.read_csv(RUN_STATS_PATH).to_dict(orient="records")
+# 关联特征修正的影响统计：每段影像的稠密候选缓存中，两份关联概率之差 |d4_prob − prob| 的均值、差值超过 0.01 的
+#   候选对数，以及为找回概率打分保存的检测候选数。只用于报告，整段 try / except，出错也不影响提交。
+_d4rr_cache_stats = []
+try:
+    for _d4rr_npz_path in sorted((WORKING_DIR / "x138_candidate_prob_cache").glob("*.probabilities.npz")):
+        with np.load(_d4rr_npz_path, allow_pickle=False) as _d4rr_npz:
+            _d4rr_delta = np.abs(_d4rr_npz["d4_prob"].astype(np.float64) - _d4rr_npz["prob"].astype(np.float64))
+            _d4rr_cache_stats.append({
+                "dataset": _d4rr_npz_path.name.split(".")[0],
+                "pairs": int(len(_d4rr_delta)),
+                "d4_mean_abs_change": float(_d4rr_delta.mean()) if len(_d4rr_delta) else 0.0,
+                "d4_pairs_changed_gt_001": int((_d4rr_delta > 0.01).sum()),
+                "detector_candidates": int(len(_d4rr_npz["detector_node_ids"])),
+            })
+except Exception as _d4rr_exc:
+    _d4rr_cache_stats.append({"error": f"{type(_d4rr_exc).__name__}: {_d4rr_exc}"})
+# 汇总报告 x138_candidate_relink_report.json（只供事后核查，不影响 submission.csv）。字段名沿用开发时的命名：
+#   reference / experiment 是两遍的标签（"exact_reproduced_x138" 指参照一遍即公开基线，严格说法见本段开头）；
+#   cache_design 描述稠密候选缓存（10 µm 半径、每个目标前 12 个候选），其中 readmitted_nodes 一项是旧描述：
+#     打开找回概率打分后，找回的节点已经继承检测候选的概率；
+#   sha256 是参照与最终两份 CSV 的指纹；jump_modules 记录运行时限、两个 3 µm 跳变门限，以及逐影像的
+#     repair_fallback（是否走了逐片兜底）、deadline_degraded（是否已超时降级）、repair_seconds（后处理耗时）；
+#   modules 记录分裂补全打分器模块代码的指纹（_D1_SHA；键名 d1_pw10c_final 是该模块的版本标签）、
+#     几个全局参数和 m_ 前缀的逐影像计数；d4_readmitp 汇总关联特征修正与找回概率打分的诊断。
+_DR_REPORT = {
+    "reference": "exact_reproduced_x138",
+    "experiment": "x138_candidate_probability_relink_v1",
+    "selected_original_config": selected_label,
+    "selected_original_overrides": selected_config,
+    "cache_design": {"raw_radius_um": 10.0, "topk_per_target": 12,
+                     "readmitted_nodes": "original geometric fallback"},
+    "local_validation": _DR_VAL,
+    "visible_test_graph_diff": _DR_GRAPH_DIFF,
+    "final_candidate_diagnostics": [
+        {k: v for k, v in row.items() if k == "dataset" or k.startswith("candidate_")}
+        for row in _dr_final_stats
+    ],
+    "sha256": {
+        "reference": _dr_hashlib.sha256(_DR_BASE_CSV.read_bytes()).hexdigest(),
+        "submission": _dr_hashlib.sha256(SUBMISSION_PATH.read_bytes()).hexdigest(),
+    },
+    "jump_modules": {
+        "repair_deadline_s": REPAIR_DEADLINE_S,
+        "relink_global_seed_min_um": MOTION_RELINK_GLOBAL_SEED_MIN_UM,
+        "linefit_jump_min_um": OUTPUT_LINEFIT_JUMP_MIN_UM,
+        "per_video": [
+            {
+                k: v for k, v in row.items()
+                if k in ("dataset", "repair_fallback", "deadline_degraded", "repair_seconds")
+                or k.startswith(("motion_relink_global_seed_", "linefit_jump_"))
+            }
+            for row in _dr_final_stats
+        ],
+    },
+    "modules": {
+        "arm_files": {"d1_pw10c_final": _D1_SHA},
+        "parameters": {"ILP_DIVISION_WEIGHT": ILP_DIVISION_WEIGHT, "READMIT_MIN_SCORE": READMIT_MIN_SCORE,
+                       "DET_THRESHOLD": DET_THRESHOLD, "REPAIR_DEADLINE_S": REPAIR_DEADLINE_S},
+        "per_video": [
+            {k: v for k, v in row.items() if k in ("dataset", "nodes", "edges", "repair_seconds", "repair_fallback",
+                                                  "deadline_degraded", "readmitted_nodes", "safe_divisions_added",
+                                                  "motion_relink_skipped_large_frame") or k.startswith("m_")}
+            for row in _dr_final_stats
+        ],
+    },
+    "d4_readmitp": {
+        "d4_probability_active": True,
+        "readmit_probability_active": True,
+        "visible_diagnostics": _D4RR_DIAG,
+        "probability_cache": _d4rr_cache_stats,
+        "per_video": [
+            {
+                k: v for k, v in row.items()
+                if k in ("dataset", "readmitted_nodes") or k.startswith("readmit_prob_")
+            }
+            for row in _dr_final_stats
+        ],
+    },
+}
+# 若最终图与参照图完全相同，说明新模块一处都没有改动（例如开关没有被读到），需要排查。
+_DR_REPORT["graph_identical_to_reference"] = all(
+    row["nodes_added"] == row["nodes_removed"] == row["nodes_moved"] ==
+    row["edges_added"] == row["edges_removed"] == 0
+    for row in _DR_GRAPH_DIFF.values()
+)
+_DR_REPORT["csv_identical_to_reference"] = (
+    _DR_REPORT["sha256"]["reference"] == _DR_REPORT["sha256"]["submission"]
+)
+_DR_REPORT_PATH = WORKING_DIR / "x138_candidate_relink_report.json"
+_DR_REPORT_PATH.write_text(
+    json.dumps(_DR_REPORT, indent=2, ensure_ascii=False, default=float), encoding="utf-8"
+)
+# 打印摘要：本地代理分（验证器关闭时为 None -> None）、每段影像的边对称差、是否与参照完全相同、
+#   各模块统计、最终 CSV 的路径与 sha256、参照 CSV 与报告的路径。
+print("Candidate relink local proxy:",
+      _DR_VAL.get("reference", {}).get("proxy_score"), "->",
+      _DR_VAL.get("candidate_relink", {}).get("proxy_score"))
+print("Visible graph edge differences:",
+      {stem: row["edge_symmetric_difference"] for stem, row in _DR_GRAPH_DIFF.items()})
+print("Graph identical to original x138:", _DR_REPORT["graph_identical_to_reference"])
+print("Candidate coverage:", _DR_REPORT["final_candidate_diagnostics"])
+print("Jump modules:", _DR_REPORT["jump_modules"])
+print("D4 / readmit-p:", _DR_REPORT["d4_readmitp"])
+print("Modules:", _DR_REPORT["modules"])
+print("Final experimental submission:", SUBMISSION_PATH,
+      "SHA256:", _DR_REPORT["sha256"]["submission"])
+print("Reference submission:", _DR_BASE_CSV)
+print("Report:", _DR_REPORT_PATH)
+
+
+# ===== 第 12 段：流水线清单（打印实际生效的状态，而不只是配置值） =====
+# 隐藏集重跑时看不到日志，所以要在可见集的保存运行里一眼确认所有依赖都真的生效，特别是两种“静默退化”：
+#   · 副模型权重没找到：检测退化为单模型；
+#   · DeepCenter 要求了却没加载：缺口闭合与安全分裂的 DeepCenter 否决全部失效，分裂补全打分器的 3 个
+#     DeepCenter 特征也全部变成 0。
+#   在本管线里这两种情况其实到不了这里：第 3 段对副模型权重做了 SHA256 校验（缺失或不符直接报错），第 0 段设了
+#   REQUIRE_DEEPCENTER_VETO = 1（第 5 段加载不到 DeepCenter 就报错）。所以这份清单是第二道保险，
+#   主要防止以后有人改了配置却没注意到。
+# 另外打印双向调和融合的权重与模式、安全分裂门限、验证器状态。本段只打印，不改变任何输出。
+
+print("=" * 78)
+print("PIPELINE MANIFEST -- resolved state, not just config")
+print("=" * 78)
+
+# 副模型（另一个随机种子）权重：第 3 段把路径写进 BIOHUB_SECONDARY_WEIGHTS；文件不存在时检测会退化成单模型。
+_secondary_weights_env = os.environ.get("BIOHUB_SECONDARY_WEIGHTS", "")
+_secondary_ready = bool(_secondary_weights_env and Path(_secondary_weights_env).exists())
+print(f"Dual-seed ensemble:      requested=True  weights_found={_secondary_ready}"
+      f"{'  <-- FALLING BACK TO SINGLE-SEED, check BIOHUB_SECONDARY_WEIGHTS' if not _secondary_ready else ''}")
+
+# 双向调和：关联概率按正向（t → t+1）和反向（t+1 → t）各算一次，再做加权调和平均（反向权重 0.15）。
+#   调和平均要求两个方向互相支持：任一方向给出很低的概率，融合后的概率都会被压低。
+_bidir_weight = float(os.environ.get("BIOHUB_BIDIRECTIONAL_EDGE_WEIGHT", "0"))
+print(f"Bidirectional fusion:    weight={_bidir_weight}  "
+      f"active={_bidir_weight > 0.0}  mode={os.environ.get('BIOHUB_BIDIRECTIONAL_FUSION_MODE', '(unset)')}")
+
+# DeepCenter 中心先验：是否被要求、是否真的加载（全局 DEEPCENTER_VETO_DETECTOR 非 None）、checkpoint 路径、
+#   期望的 epoch，以及缺口否决和安全分裂否决两个开关。
+_dc_requested = os.environ.get("BIOHUB_USE_DEEPCENTER_VETO", "0") != "0"
+_dc_bundle = globals().get("DEEPCENTER_VETO_DETECTOR")
+_dc_loaded = "DEEPCENTER_VETO_DETECTOR" in globals() and _dc_bundle is not None
+_dc_path = _dc_bundle.get("path") if _dc_loaded else None
+print(f"DeepCenter veto:         requested={_dc_requested}  loaded={_dc_loaded}"
+      f"{'  <-- REQUESTED BUT NOT LOADED, gap/division vetoes are no-ops' if _dc_requested and not _dc_loaded else ''}")
+if _dc_loaded:
+    print(f"  - checkpoint file:     {_dc_path}")
+    print(f"  - expected epoch:      {os.environ.get('BIOHUB_DEEPCENTER_EXPECTED_EPOCH')}")
+print(f"  - gap veto:            {os.environ.get('BIOHUB_DEEPCENTER_GAP_VETO', '0') != '0'}")
+print(f"  - safe-div veto:       {os.environ.get('BIOHUB_DEEPCENTER_SAFE_DIV_VETO', '0') != '0'}")
+
+# 安全分裂门限（直接读环境变量）：母细胞到子细胞的距离上限、两个子细胞间距上限（µm），
+#   以及新增安全分裂数的上限：每段影像不超过当前边数的 global_cap 比例，每帧不超过该帧“只有一个子细胞的节点”数的
+#   frame_cap 比例（两个上限都至少为 1）。
+print(f"Safe-div thresholds:     parent<={os.environ.get('BIOHUB_SAFE_DIV_MAX_UM')}um  "
+      f"sister<={os.environ.get('BIOHUB_SAFE_DIV_SISTER_MAX_UM')}um  "
+      f"global_cap={os.environ.get('BIOHUB_SAFE_DIV_GLOBAL_FRAC_CAP')}  "
+      f"frame_cap={os.environ.get('BIOHUB_SAFE_DIV_FRAME_FRAC_CAP')}")
+
+print(f"Validator:               enabled={VALIDATOR_ENABLE}  "
+      f"held_out_samples={len(val_stems)}  match_radius={VALIDATOR_MATCH_RADIUS_UM}um")
+
+print("=" * 78)
